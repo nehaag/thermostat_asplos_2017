@@ -58,7 +58,10 @@ static struct vfsmount *shm_mnt;
 #include <linux/falloc.h>
 #include <linux/splice.h>
 #include <linux/security.h>
+#include <linux/shrinker.h>
+#include <linux/sysctl.h>
 #include <linux/swapops.h>
+#include <linux/pageteam.h>
 #include <linux/mempolicy.h>
 #include <linux/namei.h>
 #include <linux/ctype.h>
@@ -101,6 +104,7 @@ struct shmem_falloc {
 enum sgp_type {
 	SGP_READ,	/* don't exceed i_size, don't allocate page */
 	SGP_CACHE,	/* don't exceed i_size, may allocate page */
+	SGP_TEAM,	/* may exceed i_size, may make team page Uptodate */
 	SGP_WRITE,	/* may exceed i_size, may allocate !Uptodate page */
 	SGP_FALLOC,	/* like SGP_WRITE, but make existing page Uptodate */
 };
@@ -289,37 +293,681 @@ static bool shmem_confirm_swap(struct address_space *mapping,
 }
 
 /*
+ * Definitions for "huge tmpfs": tmpfs mounted with the huge=1 option
+ */
+
+/* Special values for /proc/sys/vm/shmem_huge */
+#define SHMEM_HUGE_DENY		(-1)
+#define SHMEM_HUGE_FORCE	(2)
+
+/* hugehint values: NULL to choose a small page always */
+#define SHMEM_ALLOC_SMALL_PAGE	((struct page *)1)
+#define SHMEM_ALLOC_HUGE_PAGE	((struct page *)2)
+#define SHMEM_RETRY_HUGE_PAGE	((struct page *)3)
+/* otherwise hugehint is the hugeteam page to be used */
+
+/* tag for shrinker to locate unfilled hugepages */
+#define SHMEM_TAG_HUGEHOLE	PAGECACHE_TAG_DIRTY
+
+/* list of inodes with unfilled hugepages, from which shrinker may free */
+static LIST_HEAD(shmem_shrinklist);
+static unsigned long shmem_shrinklist_depth;
+static DEFINE_SPINLOCK(shmem_shrinklist_lock);
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+/* ifdef here to avoid bloating shmem.o when not necessary */
+
+int shmem_huge __read_mostly;
+
+static struct page *shmem_hugeteam_lookup(struct address_space *mapping,
+					  pgoff_t index, bool speculative)
+{
+	pgoff_t start;
+	pgoff_t indice;
+	void __rcu **pagep;
+	struct page *cachepage;
+	struct page *headpage;
+	struct page *page;
+
+	/*
+	 * First called speculatively, under rcu_read_lock(), by the huge
+	 * shmem_alloc_page(): to decide whether to allocate a new huge page,
+	 * or a new small page, or use a previously allocated huge team page.
+	 *
+	 * Later called under mapping->tree_lock, by shmem_add_to_page_cache(),
+	 * to confirm the decision just before inserting into the radix_tree.
+	 */
+
+	start = round_down(index, HPAGE_PMD_NR);
+restart:
+	if (!radix_tree_gang_lookup_slot(&mapping->page_tree,
+					 &pagep, &indice, start, 1))
+		return SHMEM_ALLOC_HUGE_PAGE;
+	cachepage = rcu_dereference_check(*pagep,
+		lockdep_is_held(&mapping->tree_lock));
+	if (!cachepage || indice >= start + HPAGE_PMD_NR)
+		return SHMEM_ALLOC_HUGE_PAGE;
+	if (radix_tree_exception(cachepage)) {
+		if (radix_tree_deref_retry(cachepage))
+			goto restart;
+		return SHMEM_ALLOC_SMALL_PAGE;
+	}
+	if (!PageTeam(cachepage))
+		return SHMEM_ALLOC_SMALL_PAGE;
+	/* headpage is very often its first cachepage, but not necessarily */
+	headpage = cachepage - (indice - start);
+	page = headpage + (index - start);
+	if (speculative && !page_cache_get_speculative(page))
+		goto restart;
+	if (!PageTeam(headpage) ||
+	    headpage->mapping != mapping || headpage->index != start) {
+		if (speculative)
+			put_page(page);
+		return SHMEM_ALLOC_SMALL_PAGE;
+	}
+	return page;
+}
+
+static int shmem_freeholes(struct page *head)
+{
+	unsigned long nr = atomic_long_read(&head->team_usage);
+
+	return (nr >= HPAGE_PMD_NR) ? 0 : HPAGE_PMD_NR - nr;
+}
+
+static void shmem_clear_tag_hugehole(struct address_space *mapping,
+				     pgoff_t index)
+{
+	struct page *page = NULL;
+
+	/*
+	 * The tag was set on the first subpage to be inserted in cache.
+	 * When written sequentially, or instantiated by a huge fault,
+	 * it will be on the head page, but that's not always so.  And
+	 * radix_tree_tag_clear() succeeds when it finds a slot, whether
+	 * tag was set on it or not.  So first lookup and then clear.
+	 */
+	radix_tree_gang_lookup_tag(&mapping->page_tree, (void **)&page,
+					index, 1, SHMEM_TAG_HUGEHOLE);
+	VM_BUG_ON(!page || page->index >= index + HPAGE_PMD_NR);
+	radix_tree_tag_clear(&mapping->page_tree, page->index,
+					SHMEM_TAG_HUGEHOLE);
+}
+
+static void shmem_added_to_hugeteam(struct page *page, struct zone *zone,
+				    struct page *hugehint)
+{
+	struct address_space *mapping = page->mapping;
+	struct page *head = team_head(page);
+	int nr;
+
+	if (hugehint == SHMEM_ALLOC_HUGE_PAGE) {
+		atomic_long_set(&head->team_usage, 1);
+		radix_tree_tag_set(&mapping->page_tree, page->index,
+					SHMEM_TAG_HUGEHOLE);
+		__mod_zone_page_state(zone, NR_SHMEM_FREEHOLES, HPAGE_PMD_NR-1);
+	} else {
+		/* We do not need atomic ops until huge page gets mapped */
+		nr = atomic_long_read(&head->team_usage) + 1;
+		atomic_long_set(&head->team_usage, nr);
+		if (nr == HPAGE_PMD_NR) {
+			shmem_clear_tag_hugehole(mapping, head->index);
+			__inc_zone_state(zone, NR_SHMEM_HUGEPAGES);
+		}
+		__dec_zone_state(zone, NR_SHMEM_FREEHOLES);
+	}
+}
+
+static int shmem_populate_hugeteam(struct inode *inode, struct page *head,
+				   struct vm_area_struct *vma)
+{
+	gfp_t gfp = mapping_gfp_mask(inode->i_mapping);
+	struct page *page;
+	pgoff_t index;
+	int error;
+	int i;
+
+	/* We only have to do this once */
+	if (PageChecked(head))
+		return 0;
+
+	index = head->index;
+	for (i = 0; i < HPAGE_PMD_NR; i++, index++) {
+		if (!PageTeam(head))
+			return -EAGAIN;
+		if (PageChecked(head))
+			return 0;
+		/* Mark all pages dirty even when map is readonly, for now */
+		if (PageUptodate(head + i) && PageDirty(head + i))
+			continue;
+		error = shmem_getpage_gfp(inode, index, &page, SGP_TEAM,
+					  gfp, vma->vm_mm, NULL);
+		if (error)
+			return error;
+		SetPageDirty(page);
+		unlock_page(page);
+		put_page(page);
+		if (page != head + i)
+			return -EAGAIN;
+		cond_resched();
+	}
+
+	/* Now safe from the shrinker, but not yet from truncate */
+	return 0;
+}
+
+static int shmem_disband_hugehead(struct page *head)
+{
+	struct address_space *mapping;
+	struct zone *zone;
+	int nr = -EALREADY;	/* A racing task may have disbanded the team */
+
+	/*
+	 * In most cases the head page is locked, or not yet exposed to others:
+	 * only in the shrinker migration case might head have been truncated.
+	 * But although head->mapping may then be zeroed at any moment, mapping
+	 * stays safe because shmem_evict_inode must take the shrinklist_lock,
+	 * and our caller shmem_choose_hugehole is already holding that lock.
+	 */
+	mapping = READ_ONCE(head->mapping);
+	if (!mapping)
+		return nr;
+
+	zone = page_zone(head);
+	spin_lock_irq(&mapping->tree_lock);
+
+	if (PageTeam(head)) {
+		nr = atomic_long_read(&head->team_usage);
+		atomic_long_set(&head->team_usage, 0);
+		/*
+		 * Disable additions to the team.
+		 * Ensure head->private is written before PageTeam is
+		 * cleared, so shmem_writepage() cannot write swap into
+		 * head->private, then have it overwritten by that 0!
+		 */
+		smp_mb__before_atomic();
+		ClearPageTeam(head);
+		if (!PageSwapBacked(head))
+			head->mapping = NULL;
+
+		if (nr >= HPAGE_PMD_NR) {
+			ClearPageChecked(head);
+			__dec_zone_state(zone, NR_SHMEM_HUGEPAGES);
+			VM_BUG_ON(nr != HPAGE_PMD_NR);
+		} else if (nr) {
+			shmem_clear_tag_hugehole(mapping, head->index);
+			__mod_zone_page_state(zone, NR_SHMEM_FREEHOLES,
+						nr - HPAGE_PMD_NR);
+		}
+	}
+
+	spin_unlock_irq(&mapping->tree_lock);
+	return nr;
+}
+
+static void shmem_disband_hugetails(struct page *head,
+				    struct list_head *list, int nr)
+{
+	struct page *page;
+	struct page *endpage;
+
+	page = head;
+	endpage = head + HPAGE_PMD_NR;
+
+	if (!nr) {
+		/*
+		 * The usual case: disbanding team and freeing holes as cold
+		 * (cold being more likely to preserve high-order extents).
+		 */
+		if (!PageSwapBacked(page)) {	/* head was not in cache */
+			if (put_page_testzero(page))
+				free_hot_cold_page(page, 1);
+		}
+		while (++page < endpage) {
+			if (PageTeam(page))
+				ClearPageTeam(page);
+			else if (put_page_testzero(page))
+				free_hot_cold_page(page, 1);
+		}
+	} else if (nr < 0) {
+		struct zone *zone = page_zone(page);
+		int orig_nr = nr;
+		/*
+		 * Shrinker wants to migrate cache pages from this team.
+		 */
+		if (!PageSwapBacked(page)) {	/* head was not in cache */
+			if (put_page_testzero(page))
+				free_hot_cold_page(page, 1);
+		} else if (isolate_lru_page(page) == 0) {
+			list_add_tail(&page->lru, list);
+			nr++;
+		}
+		while (++page < endpage) {
+			if (PageTeam(page)) {
+				if (isolate_lru_page(page) == 0) {
+					list_add_tail(&page->lru, list);
+					nr++;
+				}
+				ClearPageTeam(page);
+			} else if (put_page_testzero(page))
+				free_hot_cold_page(page, 1);
+		}
+		/* Yes, shmem counts in NR_ISOLATED_ANON but NR_FILE_PAGES */
+		mod_zone_page_state(zone, NR_ISOLATED_ANON, nr - orig_nr);
+	} else {
+		/*
+		 * Shrinker wants free pages from this team to migrate into.
+		 */
+		if (!PageSwapBacked(page)) {	/* head was not in cache */
+			list_add_tail(&page->lru, list);
+			nr--;
+		}
+		while (++page < endpage) {
+			if (PageTeam(page))
+				ClearPageTeam(page);
+			else if (nr) {
+				list_add_tail(&page->lru, list);
+				nr--;
+			} else if (put_page_testzero(page))
+				free_hot_cold_page(page, 1);
+		}
+	}
+	VM_BUG_ON(nr > 0);	/* maybe a few were not isolated */
+}
+
+static void shmem_disband_hugeteam(struct page *page)
+{
+	struct page *head = team_head(page);
+	int nr_used;
+
+	/*
+	 * In most cases, shmem_disband_hugeteam() is called with this page
+	 * locked.  But shmem_getpage_gfp()'s alloced_huge failure case calls
+	 * it after unlocking and releasing: because it has not exposed the
+	 * page, and prefers free_hot_cold_page to free it all cold together.
+	 *
+	 * The truncation case may need a second lock, on the head page,
+	 * to guard against races while shmem fault prepares a huge pmd.
+	 * Little point in returning error, it has to check PageTeam anyway.
+	 */
+	if (head != page) {
+		if (!get_page_unless_zero(head))
+			return;
+		if (!trylock_page(head)) {
+			put_page(head);
+			return;
+		}
+		if (!PageTeam(head)) {
+			unlock_page(head);
+			put_page(head);
+			return;
+		}
+	}
+
+	/*
+	 * truncate_inode_page() will unmap page if page_mapped(page),
+	 * but there's a race by which the team could be hugely mapped,
+	 * with page_mapped(page) saying false.  So check here if the
+	 * head is hugely mapped, and if so unmap page to remap team.
+	 * Use a loop because there is no good locking against a
+	 * concurrent remap_team_by_ptes().
+	 */
+	while (team_pmd_mapped(head)) {
+		unmap_mapping_range(page->mapping,
+			(loff_t)page->index << PAGE_SHIFT, PAGE_SIZE, 0);
+	}
+
+	/*
+	 * Disable preemption because truncation may end up spinning until a
+	 * tail PageTeam has been cleared: we hold the lock as briefly as we
+	 * can (splitting disband in two stages), but better not be preempted.
+	 */
+	preempt_disable();
+	nr_used = shmem_disband_hugehead(head);
+	if (head != page)
+		unlock_page(head);
+	if (nr_used >= 0)
+		shmem_disband_hugetails(head, NULL, 0);
+	if (head != page)
+		put_page(head);
+	preempt_enable();
+}
+
+static struct page *shmem_get_hugehole(struct address_space *mapping,
+				       unsigned long *index)
+{
+	struct page *page;
+	struct page *head;
+
+	rcu_read_lock();
+	while (radix_tree_gang_lookup_tag(&mapping->page_tree, (void **)&page,
+					  *index, 1, SHMEM_TAG_HUGEHOLE)) {
+		if (radix_tree_exception(page))
+			continue;
+		if (!page_cache_get_speculative(page))
+			continue;
+		if (!PageTeam(page) || page->mapping != mapping)
+			goto release;
+		head = team_head(page);
+		if (head != page) {
+			if (!page_cache_get_speculative(head))
+				goto release;
+			put_page(page);
+			page = head;
+			if (!PageTeam(page) || page->mapping != mapping)
+				goto release;
+		}
+		if (shmem_freeholes(head) > 0) {
+			rcu_read_unlock();
+			*index = head->index + HPAGE_PMD_NR;
+			return head;
+		}
+release:
+		put_page(page);
+	}
+	rcu_read_unlock();
+	return NULL;
+}
+
+static unsigned long shmem_choose_hugehole(struct list_head *fromlist,
+					   struct list_head *tolist)
+{
+	unsigned long freed = 0;
+	unsigned long double_depth;
+	struct list_head *this, *next;
+	struct shmem_inode_info *info;
+	struct address_space *mapping;
+	struct page *frompage = NULL;
+	struct page *topage = NULL;
+	struct page *page;
+	pgoff_t index;
+	int fromused;
+	int toused;
+	int nid;
+
+	double_depth = 0;
+	spin_lock(&shmem_shrinklist_lock);
+	list_for_each_safe(this, next, &shmem_shrinklist) {
+		info = list_entry(this, struct shmem_inode_info, shrinklist);
+		mapping = info->vfs_inode.i_mapping;
+		if (!radix_tree_tagged(&mapping->page_tree,
+					SHMEM_TAG_HUGEHOLE)) {
+			list_del_init(&info->shrinklist);
+			shmem_shrinklist_depth--;
+			continue;
+		}
+		index = 0;
+		while ((page = shmem_get_hugehole(mapping, &index))) {
+			/* Choose to migrate from page with least in use */
+			if (!frompage ||
+			    shmem_freeholes(page) > shmem_freeholes(frompage)) {
+				if (frompage)
+					put_page(frompage);
+				frompage = page;
+				if (shmem_freeholes(page) == HPAGE_PMD_NR-1) {
+					/* No point searching further */
+					double_depth = -3;
+					break;
+				}
+			} else
+				put_page(page);
+		}
+
+		/* Only reclaim from the older half of the shrinklist */
+		double_depth += 2;
+		if (double_depth >= min(shmem_shrinklist_depth, 2000UL))
+			break;
+	}
+
+	if (!frompage)
+		goto unlock;
+	preempt_disable();
+	fromused = shmem_disband_hugehead(frompage);
+	spin_unlock(&shmem_shrinklist_lock);
+	if (fromused > 0)
+		shmem_disband_hugetails(frompage, fromlist, -fromused);
+	preempt_enable();
+	nid = page_to_nid(frompage);
+	put_page(frompage);
+
+	if (fromused <= 0)
+		return 0;
+	freed = HPAGE_PMD_NR - fromused;
+	if (fromused > HPAGE_PMD_NR/2)
+		return freed;
+
+	double_depth = 0;
+	spin_lock(&shmem_shrinklist_lock);
+	list_for_each_safe(this, next, &shmem_shrinklist) {
+		info = list_entry(this, struct shmem_inode_info, shrinklist);
+		mapping = info->vfs_inode.i_mapping;
+		if (!radix_tree_tagged(&mapping->page_tree,
+					SHMEM_TAG_HUGEHOLE)) {
+			list_del_init(&info->shrinklist);
+			shmem_shrinklist_depth--;
+			continue;
+		}
+		index = 0;
+		while ((page = shmem_get_hugehole(mapping, &index))) {
+			/* Choose to migrate to page with just enough free */
+			if (shmem_freeholes(page) >= fromused &&
+			    page_to_nid(page) == nid) {
+				if (!topage || shmem_freeholes(page) <
+					      shmem_freeholes(topage)) {
+					if (topage)
+						put_page(topage);
+					topage = page;
+					if (shmem_freeholes(page) == fromused) {
+						/* No point searching further */
+						double_depth = -3;
+						break;
+					}
+				} else
+					put_page(page);
+			} else
+				put_page(page);
+		}
+
+		/* Only reclaim from the older half of the shrinklist */
+		double_depth += 2;
+		if (double_depth >= min(shmem_shrinklist_depth, 2000UL))
+			break;
+	}
+
+	if (!topage)
+		goto unlock;
+	preempt_disable();
+	toused = shmem_disband_hugehead(topage);
+	spin_unlock(&shmem_shrinklist_lock);
+	if (toused > 0) {
+		if (HPAGE_PMD_NR - toused >= fromused)
+			shmem_disband_hugetails(topage, tolist, fromused);
+		else
+			shmem_disband_hugetails(topage, NULL, 0);
+		freed += HPAGE_PMD_NR - toused;
+	}
+	preempt_enable();
+	put_page(topage);
+	return freed;
+unlock:
+	spin_unlock(&shmem_shrinklist_lock);
+	return freed;
+}
+
+static struct page *shmem_get_migrate_page(struct page *frompage,
+					   unsigned long private, int **result)
+{
+	struct list_head *tolist = (struct list_head *)private;
+	struct page *topage;
+
+	VM_BUG_ON(list_empty(tolist));
+	topage = list_first_entry(tolist, struct page, lru);
+	list_del(&topage->lru);
+	return topage;
+}
+
+static void shmem_put_migrate_page(struct page *topage, unsigned long private)
+{
+	struct list_head *tolist = (struct list_head *)private;
+
+	list_add(&topage->lru, tolist);
+}
+
+static void shmem_putback_migrate_pages(struct list_head *tolist)
+{
+	struct page *topage;
+	struct page *next;
+
+	/*
+	 * The tolist pages were not counted in NR_ISOLATED, so stats
+	 * would go wrong if putback_movable_pages() were used on them.
+	 * Indeed, even putback_lru_page() is wrong for these pages.
+	 */
+	list_for_each_entry_safe(topage, next, tolist, lru) {
+		list_del(&topage->lru);
+		if (put_page_testzero(topage))
+			free_hot_cold_page(topage, 1);
+	}
+}
+
+static unsigned long shmem_shrink_hugehole(struct shrinker *shrink,
+					   struct shrink_control *sc)
+{
+	unsigned long freed;
+	LIST_HEAD(fromlist);
+	LIST_HEAD(tolist);
+
+	if (list_empty(&shmem_shrinklist))
+		return SHRINK_STOP;
+	freed = shmem_choose_hugehole(&fromlist, &tolist);
+	if (list_empty(&fromlist))
+		return SHRINK_STOP;
+	if (!list_empty(&tolist)) {
+		migrate_pages(&fromlist, shmem_get_migrate_page,
+			      shmem_put_migrate_page, (unsigned long)&tolist,
+			      MIGRATE_SYNC, MR_SHMEM_HUGEHOLE);
+		preempt_disable();
+		drain_local_pages(NULL);  /* try to preserve huge freed page */
+		preempt_enable();
+		shmem_putback_migrate_pages(&tolist);
+	}
+	putback_movable_pages(&fromlist); /* if any were left behind */
+	return freed;
+}
+
+static unsigned long shmem_count_hugehole(struct shrinker *shrink,
+					  struct shrink_control *sc)
+{
+	/*
+	 * Huge hole space is not charged to any memcg:
+	 * only shrink it for global reclaim.
+	 * But at present we're only called for global reclaim anyway.
+	 */
+	if (list_empty(&shmem_shrinklist))
+		return 0;
+	return global_page_state(NR_SHMEM_FREEHOLES);
+}
+
+static struct shrinker shmem_hugehole_shrinker = {
+	.count_objects = shmem_count_hugehole,
+	.scan_objects = shmem_shrink_hugehole,
+	.seeks = DEFAULT_SEEKS,		/* would another value work better? */
+	.batch = HPAGE_PMD_NR,		/* would another value work better? */
+};
+
+#else /* !CONFIG_TRANSPARENT_HUGEPAGE */
+
+#define shmem_huge SHMEM_HUGE_DENY
+
+static inline struct page *shmem_hugeteam_lookup(struct address_space *mapping,
+					pgoff_t index, bool speculative)
+{
+	BUILD_BUG();
+	return SHMEM_ALLOC_SMALL_PAGE;
+}
+
+static inline void shmem_disband_hugeteam(struct page *page)
+{
+	BUILD_BUG();
+}
+
+static inline void shmem_added_to_hugeteam(struct page *page,
+				struct zone *zone, struct page *hugehint)
+{
+}
+
+static inline int shmem_populate_hugeteam(struct inode *inode,
+				struct page *head, struct vm_area_struct *vma)
+{
+	return -EAGAIN;
+}
+
+static inline unsigned long shmem_shrink_hugehole(struct shrinker *shrink,
+						  struct shrink_control *sc)
+{
+	return 0;
+}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+
+/*
  * Like add_to_page_cache_locked, but error if expected item has gone.
  */
-static int shmem_add_to_page_cache(struct page *page,
-				   struct address_space *mapping,
-				   pgoff_t index, void *expected)
+static int
+shmem_add_to_page_cache(struct page *page, struct address_space *mapping,
+			pgoff_t index, void *expected, struct page *hugehint)
 {
+	struct zone *zone = page_zone(page);
 	int error;
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
-	VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
-
-	get_page(page);
-	page->mapping = mapping;
-	page->index = index;
+	VM_BUG_ON(expected && hugehint);
 
 	spin_lock_irq(&mapping->tree_lock);
+	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugehint) {
+		if (shmem_hugeteam_lookup(mapping, index, false) != hugehint) {
+			error = -EEXIST;	/* will retry */
+			goto errout;
+		}
+		if (!PageSwapBacked(page)) {	/* huge needs special care */
+			SetPageSwapBacked(page);
+			SetPageTeam(page);
+		}
+	}
+
+	page->mapping = mapping;
+	page->index = index;
+	/* smp_wmb()?  That's in radix_tree_insert()'s rcu_assign_pointer() */
+
 	if (!expected)
 		error = radix_tree_insert(&mapping->page_tree, index, page);
 	else
 		error = shmem_radix_tree_replace(mapping, index, expected,
 								 page);
-	if (!error) {
-		mapping->nrpages++;
-		__inc_zone_page_state(page, NR_FILE_PAGES);
-		__inc_zone_page_state(page, NR_SHMEM);
-		spin_unlock_irq(&mapping->tree_lock);
-	} else {
+	if (unlikely(error))
+		goto errout;
+
+	if (PageTeam(page))
+		shmem_added_to_hugeteam(page, zone, hugehint);
+	else
+		get_page(page);
+
+	mapping->nrpages++;
+	__inc_zone_state(zone, NR_FILE_PAGES);
+	__inc_zone_state(zone, NR_SHMEM);
+	spin_unlock_irq(&mapping->tree_lock);
+	return 0;
+
+errout:
+	if (PageTeam(page)) {
+		/* We use SwapBacked to indicate if already in cache */
+		ClearPageSwapBacked(page);
+		if (index & (HPAGE_PMD_NR-1)) {
+			ClearPageTeam(page);
+			page->mapping = NULL;
+		}
+	} else
 		page->mapping = NULL;
-		spin_unlock_irq(&mapping->tree_lock);
-		put_page(page);
-	}
+	spin_unlock_irq(&mapping->tree_lock);
 	return error;
 }
 
@@ -481,15 +1129,16 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 	struct pagevec pvec;
 	pgoff_t indices[PAGEVEC_SIZE];
 	long nr_swaps_freed = 0;
+	pgoff_t warm_index = 0;
 	pgoff_t index;
 	int i;
 
 	if (lend == -1)
 		end = -1;	/* unsigned, so actually very big */
 
-	pagevec_init(&pvec, 0);
 	index = start;
 	while (index < end) {
+		pagevec_init(&pvec, index < warm_index);
 		pvec.nr = find_get_entries(mapping, index,
 			min(end - index, (pgoff_t)PAGEVEC_SIZE),
 			pvec.pages, indices);
@@ -515,7 +1164,21 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 			if (!unfalloc || !PageUptodate(page)) {
 				if (page->mapping == mapping) {
 					VM_BUG_ON_PAGE(PageWriteback(page), page);
-					truncate_inode_page(mapping, page);
+					if (PageTeam(page)) {
+						/*
+						 * Try preserve huge pages by
+						 * freeing to tail of pcp list.
+						 */
+						pvec.cold = 1;
+						warm_index = round_up(
+						    index + 1, HPAGE_PMD_NR);
+						shmem_disband_hugeteam(page);
+						/* but that may not succeed */
+					}
+					if (!PageTeam(page)) {
+						truncate_inode_page(mapping,
+								    page);
+					}
 				}
 			}
 			unlock_page(page);
@@ -557,7 +1220,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 	index = start;
 	while (index < end) {
 		cond_resched();
-
+		/* Carrying warm_index from first pass is the best we can do */
+		pagevec_init(&pvec, index < warm_index);
 		pvec.nr = find_get_entries(mapping, index,
 				min(end - index, (pgoff_t)PAGEVEC_SIZE),
 				pvec.pages, indices);
@@ -592,7 +1256,26 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 			if (!unfalloc || !PageUptodate(page)) {
 				if (page->mapping == mapping) {
 					VM_BUG_ON_PAGE(PageWriteback(page), page);
-					truncate_inode_page(mapping, page);
+					if (PageTeam(page)) {
+						/*
+						 * Try preserve huge pages by
+						 * freeing to tail of pcp list.
+						 */
+						pvec.cold = 1;
+						warm_index = round_up(
+						    index + 1, HPAGE_PMD_NR);
+						shmem_disband_hugeteam(page);
+						/* but that may not succeed */
+					}
+					if (!PageTeam(page)) {
+						truncate_inode_page(mapping,
+								    page);
+					} else if (end != -1) {
+						/* Punch retry disband now */
+						unlock_page(page);
+						index--;
+						break;
+					}
 				} else {
 					/* Page was replaced by swap: retry */
 					unlock_page(page);
@@ -633,6 +1316,21 @@ static int shmem_getattr(struct vfsmount *mnt, struct dentry *dentry,
 	}
 	generic_fillattr(inode, stat);
 	return 0;
+}
+
+static int shmem_error_remove_page(struct address_space *mapping,
+				   struct page *page)
+{
+	if (PageTeam(page)) {
+		shmem_disband_hugeteam(page);
+		while (unlikely(PageTeam(page))) {
+			unlock_page(page);
+			cond_resched();
+			lock_page(page);
+			shmem_disband_hugeteam(page);
+		}
+	}
+	return generic_error_remove_page(mapping, page);
 }
 
 static int shmem_setattr(struct dentry *dentry, struct iattr *attr)
@@ -691,6 +1389,14 @@ static void shmem_evict_inode(struct inode *inode)
 		shmem_unacct_size(info->flags, inode->i_size);
 		inode->i_size = 0;
 		shmem_truncate_range(inode, 0, (loff_t)-1);
+		if (!list_empty(&info->shrinklist)) {
+			spin_lock(&shmem_shrinklist_lock);
+			if (!list_empty(&info->shrinklist)) {
+				list_del_init(&info->shrinklist);
+				shmem_shrinklist_depth--;
+			}
+			spin_unlock(&shmem_shrinklist_lock);
+		}
 		if (!list_empty(&info->swaplist)) {
 			mutex_lock(&shmem_swaplist_mutex);
 			list_del_init(&info->swaplist);
@@ -764,7 +1470,7 @@ static int shmem_unuse_inode(struct shmem_inode_info *info,
 	 */
 	if (!error)
 		error = shmem_add_to_page_cache(*pagep, mapping, index,
-						radswap);
+						radswap, NULL);
 	if (error != -ENOMEM) {
 		/*
 		 * Truncation and eviction use free_swap_and_cache(), which
@@ -902,9 +1608,24 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 		SetPageUptodate(page);
 	}
 
+	if (PageTeam(page)) {
+		struct page *head = team_head(page);
+		/*
+		 * Only proceed if this is head, or if head is unpopulated.
+		 */
+		if (page != head && PageSwapBacked(head))
+			goto redirty;
+	}
+
 	swap = get_swap_page();
 	if (!swap.val)
 		goto redirty;
+
+	if (PageTeam(page)) {
+		shmem_disband_hugeteam(page);
+		if (PageTeam(page))
+			goto free_swap;
+	}
 
 	if (mem_cgroup_try_charge_swap(page, swap))
 		goto free_swap;
@@ -1005,8 +1726,8 @@ static struct page *shmem_swapin(swp_entry_t swap, gfp_t gfp,
 	return page;
 }
 
-static struct page *shmem_alloc_page(gfp_t gfp,
-			struct shmem_inode_info *info, pgoff_t index)
+static struct page *shmem_alloc_page(gfp_t gfp, struct shmem_inode_info *info,
+	pgoff_t index, struct page **hugehint, struct page **alloced_huge)
 {
 	struct vm_area_struct pvma;
 	struct page *page;
@@ -1018,12 +1739,63 @@ static struct page *shmem_alloc_page(gfp_t gfp,
 	pvma.vm_ops = NULL;
 	pvma.vm_policy = mpol_shared_policy_lookup(&info->policy, index);
 
+	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && *hugehint) {
+		struct address_space *mapping = info->vfs_inode.i_mapping;
+		struct page *head;
+
+		rcu_read_lock();
+		*hugehint = shmem_hugeteam_lookup(mapping, index, true);
+		rcu_read_unlock();
+
+		if (*hugehint == SHMEM_ALLOC_HUGE_PAGE) {
+			head = alloc_pages_vma(gfp|__GFP_NORETRY|__GFP_NOWARN,
+				HPAGE_PMD_ORDER, &pvma, 0, numa_node_id(),
+				true);
+			if (!head &&
+			    shmem_shrink_hugehole(NULL, NULL) != SHRINK_STOP) {
+				head = alloc_pages_vma(
+					gfp|__GFP_NORETRY|__GFP_NOWARN,
+					HPAGE_PMD_ORDER, &pvma, 0,
+					numa_node_id(), true);
+			}
+			if (head) {
+				split_page(head, HPAGE_PMD_ORDER);
+
+				/* Prepare head page for add_to_page_cache */
+				atomic_long_set(&head->team_usage, 0);
+				__SetPageTeam(head);
+				head->mapping = mapping;
+				head->index = round_down(index, HPAGE_PMD_NR);
+				*alloced_huge = head;
+
+				/* Prepare wanted page for add_to_page_cache */
+				page = head + (index & (HPAGE_PMD_NR-1));
+				get_page(page);
+				__SetPageLocked(page);
+				goto out;
+			}
+		} else if (*hugehint != SHMEM_ALLOC_SMALL_PAGE) {
+			page = *hugehint;
+			head = page - (index & (HPAGE_PMD_NR-1));
+			/*
+			 * This page is already visible: so we cannot use the
+			 * __nonatomic ops, must check that it has not already
+			 * been added, and cannot set the flags it needs until
+			 * add_to_page_cache has the tree_lock.
+			 */
+			lock_page(page);
+			if (PageSwapBacked(page) || !PageTeam(head))
+				*hugehint = SHMEM_RETRY_HUGE_PAGE;
+			goto out;
+		}
+	}
+
 	page = alloc_pages_vma(gfp, 0, &pvma, 0, numa_node_id(), false);
 	if (page) {
 		__SetPageLocked(page);
 		__SetPageSwapBacked(page);
 	}
-
+out:
 	/* Drop reference taken by mpol_shared_policy_lookup() */
 	mpol_cond_put(pvma.vm_policy);
 
@@ -1054,6 +1826,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 	struct address_space *swap_mapping;
 	pgoff_t swap_index;
 	int error;
+	struct page *hugehint = NULL;
 
 	oldpage = *pagep;
 	swap_index = page_private(oldpage);
@@ -1064,7 +1837,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 	 * limit chance of success by further cpuset and node constraints.
 	 */
 	gfp &= ~GFP_CONSTRAINT_MASK;
-	newpage = shmem_alloc_page(gfp, info, index);
+	newpage = shmem_alloc_page(gfp, info, index, &hugehint, &hugehint);
 	if (!newpage)
 		return -ENOMEM;
 
@@ -1118,8 +1891,8 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
  * vm. If we swap it in we mark it dirty since we also free the swap
  * entry since a page cannot live in both the swap and page cache.
  *
- * fault_mm and fault_type are only supplied by shmem_fault:
- * otherwise they are NULL.
+ * fault_mm and fault_type are only supplied by shmem_fault
+ * (or hugeteam population): otherwise they are NULL.
  */
 static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 	struct page **pagep, enum sgp_type sgp, gfp_t gfp,
@@ -1135,6 +1908,8 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 	int error;
 	int once = 0;
 	int alloced = 0;
+	struct page *hugehint;
+	struct page *alloced_huge = NULL;
 
 	if (index > (MAX_LFS_FILESIZE >> PAGE_SHIFT))
 		return -EFBIG;
@@ -1217,7 +1992,7 @@ repeat:
 				false);
 		if (!error) {
 			error = shmem_add_to_page_cache(page, mapping, index,
-						swp_to_radix_entry(swap));
+						swp_to_radix_entry(swap), NULL);
 			/*
 			 * We already confirmed swap under page lock, and make
 			 * no memory allocation here, so usually no possibility
@@ -1266,9 +2041,21 @@ repeat:
 			percpu_counter_inc(&sbinfo->used_blocks);
 		}
 
-		page = shmem_alloc_page(gfp, info, index);
+		/* Take huge hint from super, except for shmem_symlink() */
+		hugehint = NULL;
+		if (mapping->a_ops == &shmem_aops &&
+		    (shmem_huge == SHMEM_HUGE_FORCE ||
+		     (sbinfo->huge && shmem_huge != SHMEM_HUGE_DENY)))
+			hugehint = SHMEM_ALLOC_HUGE_PAGE;
+
+		page = shmem_alloc_page(gfp, info, index,
+					&hugehint, &alloced_huge);
 		if (!page) {
 			error = -ENOMEM;
+			goto decused;
+		}
+		if (hugehint == SHMEM_RETRY_HUGE_PAGE) {
+			error = -EEXIST;
 			goto decused;
 		}
 		if (sgp == SGP_WRITE)
@@ -1281,7 +2068,7 @@ repeat:
 		error = radix_tree_maybe_preload(gfp & GFP_RECLAIM_MASK);
 		if (!error) {
 			error = shmem_add_to_page_cache(page, mapping, index,
-							NULL);
+							NULL, hugehint);
 			radix_tree_preload_end();
 		}
 		if (error) {
@@ -1297,6 +2084,21 @@ repeat:
 		shmem_recalc_inode(inode);
 		spin_unlock(&info->lock);
 		alloced = true;
+
+		/*
+		 * Might we see !list_empty a moment before the shrinker
+		 * removes this inode from its list?  Unlikely, since we
+		 * already set a tag in the tree.  Some barrier required?
+		 */
+		if (alloced_huge && list_empty(&info->shrinklist)) {
+			spin_lock(&shmem_shrinklist_lock);
+			if (list_empty(&info->shrinklist)) {
+				list_add_tail(&info->shrinklist,
+					      &shmem_shrinklist);
+				shmem_shrinklist_depth++;
+			}
+			spin_unlock(&shmem_shrinklist_lock);
+		}
 
 		/*
 		 * Let SGP_FALLOC use the SGP_WRITE optimization on a new page.
@@ -1319,13 +2121,14 @@ clear:
 	/* Perhaps the file has been truncated since we checked */
 	if (sgp <= SGP_CACHE &&
 	    ((loff_t)index << PAGE_SHIFT) >= i_size_read(inode)) {
-		if (alloced) {
+		if (alloced && !PageTeam(page)) {
 			ClearPageDirty(page);
 			delete_from_page_cache(page);
 			spin_lock(&info->lock);
 			shmem_recalc_inode(inode);
 			spin_unlock(&info->lock);
 		}
+		alloced_huge = NULL;	/* already exposed: maybe now in use */
 		error = -EINVAL;
 		goto unlock;
 	}
@@ -1348,6 +2151,10 @@ unlock:
 		unlock_page(page);
 		put_page(page);
 	}
+	if (alloced_huge) {
+		shmem_disband_hugeteam(alloced_huge);
+		alloced_huge = NULL;
+	}
 	if (error == -ENOSPC && !once++) {
 		info = SHMEM_I(inode);
 		spin_lock(&info->lock);
@@ -1362,10 +2169,13 @@ unlock:
 
 static int shmem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
+	unsigned long addr = (unsigned long)vmf->virtual_address;
 	struct inode *inode = file_inode(vma->vm_file);
 	gfp_t gfp = mapping_gfp_mask(inode->i_mapping);
+	struct page *head;
+	int ret = 0;
+	int once = 0;
 	int error;
-	int ret = VM_FAULT_LOCKED;
 
 	/*
 	 * Trinity finds that probing a hole which tmpfs is punching can
@@ -1425,11 +2235,150 @@ static int shmem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		spin_unlock(&inode->i_lock);
 	}
 
+single:
+	vmf->page = NULL;
 	error = shmem_getpage_gfp(inode, vmf->pgoff, &vmf->page, SGP_CACHE,
 				  gfp, vma->vm_mm, &ret);
 	if (error)
 		return ((error == -ENOMEM) ? VM_FAULT_OOM : VM_FAULT_SIGBUS);
-	return ret;
+	ret |= VM_FAULT_LOCKED;
+
+	/*
+	 * Shall we map a huge page hugely?
+	 */
+	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		return ret;
+	if (!(vmf->flags & FAULT_FLAG_MAY_HUGE))
+		return ret;
+	if (!PageTeam(vmf->page))
+		return ret;
+	if (once++)
+		return ret;
+	if (!(vma->vm_flags & VM_SHARED) && (vmf->flags & FAULT_FLAG_WRITE))
+		return ret;
+	if ((vma->vm_start-(vma->vm_pgoff<<PAGE_SHIFT)) & (HPAGE_PMD_SIZE-1))
+		return ret;
+	if (round_down(addr, HPAGE_PMD_SIZE) < vma->vm_start)
+		return ret;
+	if (round_up(addr + 1, HPAGE_PMD_SIZE) > vma->vm_end)
+		return ret;
+	/* But omit i_size check: allow up to huge page boundary */
+
+	head = team_head(vmf->page);
+	if (!get_page_unless_zero(head))
+		return ret;
+	if (!PageTeam(head)) {
+		put_page(head);
+		return ret;
+	}
+
+	ret &= ~VM_FAULT_LOCKED;
+	unlock_page(vmf->page);
+	put_page(vmf->page);
+	if (shmem_populate_hugeteam(inode, head, vma) < 0) {
+		put_page(head);
+		goto single;
+	}
+	lock_page(head);
+	if (!PageTeam(head)) {
+		unlock_page(head);
+		put_page(head);
+		goto single;
+	}
+	if (!PageChecked(head))
+		SetPageChecked(head);
+
+	/* Now safe from truncation */
+	vmf->page = head;
+	return ret | VM_FAULT_LOCKED | VM_FAULT_HUGE;
+}
+
+unsigned long shmem_get_unmapped_area(struct file *file,
+				      unsigned long uaddr, unsigned long len,
+				      unsigned long pgoff, unsigned long flags)
+{
+	unsigned long (*get_area)(struct file *,
+		unsigned long, unsigned long, unsigned long, unsigned long);
+	unsigned long addr;
+	unsigned long offset;
+	unsigned long inflated_len;
+	unsigned long inflated_addr;
+	unsigned long inflated_offset;
+
+	if (len > TASK_SIZE)
+		return -ENOMEM;
+
+	get_area = current->mm->get_unmapped_area;
+	addr = get_area(file, uaddr, len, pgoff, flags);
+
+	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		return addr;
+	if (IS_ERR_VALUE(addr))
+		return addr;
+	if (addr & ~PAGE_MASK)
+		return addr;
+	if (addr > TASK_SIZE - len)
+		return addr;
+
+	if (shmem_huge == SHMEM_HUGE_DENY)
+		return addr;
+	if (len < HPAGE_PMD_SIZE)
+		return addr;
+	if (flags & MAP_FIXED)
+		return addr;
+	/*
+	 * Our priority is to support MAP_SHARED mapped hugely;
+	 * and support MAP_PRIVATE mapped hugely too, until it is COWed.
+	 * But if caller specified an address hint, respect that as before.
+	 */
+	if (uaddr)
+		return addr;
+
+	if (shmem_huge != SHMEM_HUGE_FORCE) {
+		struct super_block *sb;
+
+		if (file) {
+			VM_BUG_ON(file->f_op != &shmem_file_operations);
+			sb = file_inode(file)->i_sb;
+		} else {
+			/*
+			 * Called directly from mm/mmap.c, or drivers/char/mem.c
+			 * for "/dev/zero", to create a shared anonymous object.
+			 */
+			if (IS_ERR(shm_mnt))
+				return addr;
+			sb = shm_mnt->mnt_sb;
+		}
+		if (!SHMEM_SB(sb)->huge)
+			return addr;
+	}
+
+	offset = (pgoff << PAGE_SHIFT) & (HPAGE_PMD_SIZE-1);
+	if (offset && offset + len < 2 * HPAGE_PMD_SIZE)
+		return addr;
+	if ((addr & (HPAGE_PMD_SIZE-1)) == offset)
+		return addr;
+
+	inflated_len = len + HPAGE_PMD_SIZE - PAGE_SIZE;
+	if (inflated_len > TASK_SIZE)
+		return addr;
+	if (inflated_len < len)
+		return addr;
+
+	inflated_addr = get_area(NULL, 0, inflated_len, 0, flags);
+	if (IS_ERR_VALUE(inflated_addr))
+		return addr;
+	if (inflated_addr & ~PAGE_MASK)
+		return addr;
+
+	inflated_offset = inflated_addr & (HPAGE_PMD_SIZE-1);
+	inflated_addr += offset - inflated_offset;
+	if (inflated_offset > offset)
+		inflated_addr += HPAGE_PMD_SIZE;
+
+	if (inflated_addr > TASK_SIZE - len)
+		return addr;
+	return inflated_addr;
 }
 
 #ifdef CONFIG_NUMA
@@ -1504,6 +2453,7 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 		spin_lock_init(&info->lock);
 		info->seals = F_SEAL_SEAL;
 		info->flags = flags & VM_NORESERVE;
+		INIT_LIST_HEAD(&info->shrinklist);
 		INIT_LIST_HEAD(&info->swaplist);
 		simple_xattrs_init(&info->xattrs);
 		cache_no_acl(inode);
@@ -2857,11 +3807,21 @@ static int shmem_parse_options(char *options, struct shmem_sb_info *sbinfo,
 			sbinfo->gid = make_kgid(current_user_ns(), gid);
 			if (!gid_valid(sbinfo->gid))
 				goto bad_val;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		} else if (!strcmp(this_char, "huge")) {
+			if (kstrtou8(value, 10, &sbinfo->huge) < 0 ||
+			    sbinfo->huge >= SHMEM_HUGE_FORCE)
+				goto bad_val;
+			if (sbinfo->huge && !has_transparent_hugepage())
+				goto bad_val;
+#endif
+#ifdef CONFIG_NUMA
 		} else if (!strcmp(this_char,"mpol")) {
 			mpol_put(mpol);
 			mpol = NULL;
 			if (mpol_parse_str(value, &mpol))
 				goto bad_val;
+#endif
 		} else {
 			pr_err("tmpfs: Bad mount option %s\n", this_char);
 			goto error;
@@ -2907,6 +3867,7 @@ static int shmem_remount_fs(struct super_block *sb, int *flags, char *data)
 		goto out;
 
 	error = 0;
+	sbinfo->huge = config.huge;
 	sbinfo->max_blocks  = config.max_blocks;
 	sbinfo->max_inodes  = config.max_inodes;
 	sbinfo->free_inodes = config.max_inodes - inodes;
@@ -2940,6 +3901,9 @@ static int shmem_show_options(struct seq_file *seq, struct dentry *root)
 	if (!gid_eq(sbinfo->gid, GLOBAL_ROOT_GID))
 		seq_printf(seq, ",gid=%u",
 				from_kgid_munged(&init_user_ns, sbinfo->gid));
+	/* Rightly or wrongly, show huge mount option unmasked by shmem_huge */
+	if (sbinfo->huge)
+		seq_printf(seq, ",huge=%u", sbinfo->huge);
 	shmem_show_mpol(seq, sbinfo->mpol);
 	return 0;
 }
@@ -3152,11 +4116,12 @@ static const struct address_space_operations shmem_aops = {
 #ifdef CONFIG_MIGRATION
 	.migratepage	= migrate_page,
 #endif
-	.error_remove_page = generic_error_remove_page,
+	.error_remove_page = shmem_error_remove_page,
 };
 
 static const struct file_operations shmem_file_operations = {
 	.mmap		= shmem_mmap,
+	.get_unmapped_area = shmem_get_unmapped_area,
 #ifdef CONFIG_TMPFS
 	.llseek		= shmem_file_llseek,
 	.read_iter	= shmem_file_read_iter,
@@ -3278,6 +4243,14 @@ int __init shmem_init(void)
 		pr_err("Could not kern_mount tmpfs\n");
 		goto out1;
 	}
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	if (has_transparent_hugepage()) {
+		SHMEM_SB(shm_mnt->mnt_sb)->huge = (shmem_huge > 0);
+		register_shrinker(&shmem_hugehole_shrinker);
+	} else
+		shmem_huge = 0;	/* just in case it was patched */
+#endif
 	return 0;
 
 out1:
@@ -3288,6 +4261,31 @@ out3:
 	shm_mnt = ERR_PTR(error);
 	return error;
 }
+
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && defined(CONFIG_SYSCTL)
+int shmem_huge_min = SHMEM_HUGE_DENY;
+int shmem_huge_max = SHMEM_HUGE_FORCE;
+/*
+ * /proc/sys/vm/shmem_huge sysctl for internal shm_mnt, and mount override:
+ * -1 disables huge on shm_mnt and all mounts, for emergency use
+ *  0 disables huge on internal shm_mnt (which has no way to be remounted)
+ *  1  enables huge on internal shm_mnt (which has no way to be remounted)
+ *  2  enables huge on shm_mnt and all mounts, w/o needing option, for testing
+ *     (but we may add more huge options, and push that 2 for testing upwards)
+ */
+int shmem_huge_sysctl(struct ctl_table *table, int write,
+		      void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int err;
+
+	if (!has_transparent_hugepage())
+		shmem_huge_max = 0;
+	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (write && !err && !IS_ERR(shm_mnt))
+		SHMEM_SB(shm_mnt->mnt_sb)->huge = (shmem_huge > 0);
+	return err;
+}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE && CONFIG_SYSCTL */
 
 #else /* !CONFIG_SHMEM */
 
@@ -3329,6 +4327,13 @@ int shmem_lock(struct file *file, int lock, struct user_struct *user)
 
 void shmem_unlock_mapping(struct address_space *mapping)
 {
+}
+
+unsigned long shmem_get_unmapped_area(struct file *file,
+				      unsigned long addr, unsigned long len,
+				      unsigned long pgoff, unsigned long flags)
+{
+	return current->mm->get_unmapped_area(file, addr, len, pgoff, flags);
 }
 
 void shmem_truncate_range(struct inode *inode, loff_t lstart, loff_t lend)

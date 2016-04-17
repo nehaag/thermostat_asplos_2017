@@ -3740,6 +3740,12 @@ long si_mem_available(void)
 	available += pagecache;
 
 	/*
+	 * Shmem freeholes help to keep huge pages intact, but contain
+	 * no data, and can be shrunk whenever small pages are needed.
+	 */
+	available += global_page_state(NR_SHMEM_FREEHOLES);
+
+	/*
 	 * Part of the reclaimable slab consists of items that are in use,
 	 * and cannot be freed. Cap this estimate at the low watermark.
 	 */
@@ -3810,6 +3816,11 @@ out:
 }
 
 #define K(x) ((x) << (PAGE_SHIFT-10))
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define THPAGE_PMD_NR	HPAGE_PMD_NR
+#else
+#define THPAGE_PMD_NR	0	/* Avoid BUILD_BUG() */
+#endif
 
 static void show_migration_types(unsigned char type)
 {
@@ -3866,6 +3877,7 @@ void show_free_areas(unsigned int filter)
 		" unevictable:%lu dirty:%lu writeback:%lu unstable:%lu\n"
 		" slab_reclaimable:%lu slab_unreclaimable:%lu\n"
 		" mapped:%lu shmem:%lu pagetables:%lu bounce:%lu\n"
+		" shmem_hugepages:%lu _pmdmapped:%lu _freeholes:%lu\n"
 		" free:%lu free_pcp:%lu free_cma:%lu\n",
 		global_page_state(NR_ACTIVE_ANON),
 		global_page_state(NR_INACTIVE_ANON),
@@ -3883,6 +3895,9 @@ void show_free_areas(unsigned int filter)
 		global_page_state(NR_SHMEM),
 		global_page_state(NR_PAGETABLE),
 		global_page_state(NR_BOUNCE),
+		global_page_state(NR_SHMEM_HUGEPAGES) * THPAGE_PMD_NR,
+		global_page_state(NR_SHMEM_PMDMAPPED) * THPAGE_PMD_NR,
+		global_page_state(NR_SHMEM_FREEHOLES),
 		global_page_state(NR_FREE_PAGES),
 		free_pcp,
 		global_page_state(NR_FREE_CMA_PAGES));
@@ -3917,6 +3932,9 @@ void show_free_areas(unsigned int filter)
 			" writeback:%lukB"
 			" mapped:%lukB"
 			" shmem:%lukB"
+			" _hugepages:%lukB"
+			" _pmdmapped:%lukB"
+			" _freeholes:%lukB"
 			" slab_reclaimable:%lukB"
 			" slab_unreclaimable:%lukB"
 			" kernel_stack:%lukB"
@@ -3949,6 +3967,11 @@ void show_free_areas(unsigned int filter)
 			K(zone_page_state(zone, NR_WRITEBACK)),
 			K(zone_page_state(zone, NR_FILE_MAPPED)),
 			K(zone_page_state(zone, NR_SHMEM)),
+			K(zone_page_state(zone, NR_SHMEM_HUGEPAGES) *
+							THPAGE_PMD_NR),
+			K(zone_page_state(zone, NR_SHMEM_PMDMAPPED) *
+							THPAGE_PMD_NR),
+			K(zone_page_state(zone, NR_SHMEM_FREEHOLES)),
 			K(zone_page_state(zone, NR_SLAB_RECLAIMABLE)),
 			K(zone_page_state(zone, NR_SLAB_UNRECLAIMABLE)),
 			zone_page_state(zone, NR_KERNEL_STACK) *

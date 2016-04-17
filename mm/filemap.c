@@ -2146,6 +2146,10 @@ void filemap_map_pages(struct vm_area_struct *vma, struct vm_fault *vmf)
 	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter, vmf->pgoff) {
 		if (iter.index > vmf->max_pgoff)
 			break;
+
+		pte = vmf->pte + iter.index - vmf->pgoff;
+		if (!pte_none(*pte))
+			goto next;
 repeat:
 		page = radix_tree_deref_slot(slot);
 		if (unlikely(!page))
@@ -2167,6 +2171,8 @@ repeat:
 			goto repeat;
 		}
 
+		VM_BUG_ON_PAGE(page->index != iter.index, page);
+
 		if (!PageUptodate(page) ||
 				PageReadahead(page) ||
 				PageHWPoison(page))
@@ -2179,10 +2185,6 @@ repeat:
 
 		size = round_up(i_size_read(mapping->host), PAGE_SIZE);
 		if (page->index >= size >> PAGE_SHIFT)
-			goto unlock;
-
-		pte = vmf->pte + page->index - vmf->pgoff;
-		if (!pte_none(*pte))
 			goto unlock;
 
 		if (file->f_ra.mmap_miss > 0)
