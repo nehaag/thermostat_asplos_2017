@@ -1324,6 +1324,27 @@ static struct ctl_table vm_table[] = {
 		.extra1		= &shmem_huge_min,
 		.extra2		= &shmem_huge_max,
 	},
+	{
+		.procname	= "shmem_huge_gfpmask",
+		.data		= &shmem_huge_gfpmask,
+		.maxlen		= sizeof(shmem_huge_gfpmask),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "shmem_huge_recoveries",
+		.data		= &shmem_huge_recoveries,
+		.maxlen		= sizeof(shmem_huge_recoveries),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "shmem_recovery_gfpmask",
+		.data		= &shmem_recovery_gfpmask,
+		.maxlen		= sizeof(shmem_recovery_gfpmask),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 #endif
 #ifdef CONFIG_HUGETLB_PAGE
 	{

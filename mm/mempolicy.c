@@ -2007,11 +2007,14 @@ retry_cpuset:
 
 		nid = interleave_nid(pol, vma, addr, PAGE_SHIFT + order);
 		mpol_cond_put(pol);
+		if (hugepage)
+			gfp &= ~__GFP_THISNODE;
 		page = alloc_page_interleave(gfp, order, nid);
 		goto out;
 	}
 
-	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
+	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage &&
+	    (gfp & __GFP_THISNODE))) {
 		int hpage_node = node;
 
 		/*
@@ -2024,17 +2027,17 @@ retry_cpuset:
 		 * If the policy is interleave, or does not allow the current
 		 * node in its nodemask, we allocate the standard way.
 		 */
-		if (pol->mode == MPOL_PREFERRED &&
-						!(pol->flags & MPOL_F_LOCAL))
+		if (pol->mode == MPOL_PREFERRED && !(pol->flags & MPOL_F_LOCAL))
 			hpage_node = pol->v.preferred_node;
 
 		nmask = policy_nodemask(gfp, pol);
 		if (!nmask || node_isset(hpage_node, *nmask)) {
 			mpol_cond_put(pol);
-			page = __alloc_pages_node(hpage_node,
-						gfp | __GFP_THISNODE, order);
+			page = __alloc_pages_node(hpage_node, gfp, order);
 			goto out;
 		}
+
+		gfp &= ~__GFP_THISNODE;
 	}
 
 	nmask = policy_nodemask(gfp, pol);

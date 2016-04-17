@@ -50,6 +50,10 @@ enum mem_cgroup_stat_index {
 	MEM_CGROUP_STAT_DIRTY,          /* # of dirty pages in page cache */
 	MEM_CGROUP_STAT_WRITEBACK,	/* # of pages under writeback */
 	MEM_CGROUP_STAT_SWAP,		/* # of pages, swapped out */
+	/* # of pages charged as non-disbanded huge teams */
+	MEM_CGROUP_STAT_SHMEM_HUGEPAGES,
+	/* # of pages charged as hugely mapped teams */
+	MEM_CGROUP_STAT_SHMEM_PMDMAPPED,
 	MEM_CGROUP_STAT_NSTATS,
 	/* default hierarchy stats */
 	MEMCG_KERNEL_STACK = MEM_CGROUP_STAT_NSTATS,
@@ -489,6 +493,9 @@ static inline void mem_cgroup_update_page_stat(struct page *page,
 		this_cpu_add(page->mem_cgroup->stat->count[idx], val);
 }
 
+void mem_cgroup_update_page_stat_treelocked(struct page *page,
+				enum mem_cgroup_stat_index idx, int val);
+
 static inline void mem_cgroup_inc_page_stat(struct page *page,
 					    enum mem_cgroup_stat_index idx)
 {
@@ -698,6 +705,16 @@ static inline bool task_in_memcg_oom(struct task_struct *p)
 static inline bool mem_cgroup_oom_synchronize(bool wait)
 {
 	return false;
+}
+
+static inline void mem_cgroup_update_page_stat(struct page *page,
+				enum mem_cgroup_stat_index idx, int val)
+{
+}
+
+static inline void mem_cgroup_update_page_stat_treelocked(struct page *page,
+				enum mem_cgroup_stat_index idx, int val)
+{
 }
 
 static inline void mem_cgroup_inc_page_stat(struct page *page,

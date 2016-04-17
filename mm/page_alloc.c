@@ -3085,9 +3085,15 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
 	return !!(gfp_to_alloc_flags(gfp_mask) & ALLOC_NO_WATERMARKS);
 }
 
-static inline bool is_thp_gfp_mask(gfp_t gfp_mask)
+static inline bool is_thp_allocation(gfp_t gfp_mask, unsigned int order)
 {
-	return (gfp_mask & (GFP_TRANSHUGE | __GFP_KSWAPD_RECLAIM)) == GFP_TRANSHUGE;
+	/*
+	 * !__GFP_KSWAPD_RECLAIM is an unusual choice, and no harm is done if a
+	 * similar high order allocation is occasionally misinterpreted as THP.
+	 */
+	return IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+		!(gfp_mask & __GFP_KSWAPD_RECLAIM) &&
+		(order == HPAGE_PMD_ORDER);
 }
 
 static inline struct page *
@@ -3205,7 +3211,7 @@ retry:
 		goto got_pg;
 
 	/* Checks for THP-specific high-order allocations */
-	if (is_thp_gfp_mask(gfp_mask)) {
+	if (is_thp_allocation(gfp_mask, order)) {
 		/*
 		 * If compaction is deferred for high-order allocations, it is
 		 * because sync compaction recently failed. If this is the case
@@ -3227,20 +3233,16 @@ retry:
 
 		/*
 		 * If compaction was aborted due to need_resched(), we do not
-		 * want to further increase allocation latency, unless it is
-		 * khugepaged trying to collapse.
+		 * want to further increase allocation latency at fault.
+		 * If continuing, still use asynchronous memory compaction
+		 * for THP, unless it is khugepaged trying to collapse,
+		 * or an asynchronous huge tmpfs recovery work item.
 		 */
-		if (contended_compaction == COMPACT_CONTENDED_SCHED
-			&& !(current->flags & PF_KTHREAD))
+		if (current->flags & PF_KTHREAD)
+			migration_mode = MIGRATE_SYNC_LIGHT;
+		else if (contended_compaction == COMPACT_CONTENDED_SCHED)
 			goto nopage;
-	}
-
-	/*
-	 * It can become very expensive to allocate transparent hugepages at
-	 * fault, so use asynchronous memory compaction for THP unless it is
-	 * khugepaged trying to collapse.
-	 */
-	if (!is_thp_gfp_mask(gfp_mask) || (current->flags & PF_KTHREAD))
+	} else
 		migration_mode = MIGRATE_SYNC_LIGHT;
 
 	/* Try direct reclaim and then allocating */

@@ -883,7 +883,7 @@ static inline gfp_t alloc_hugepage_direct_gfpmask(struct vm_area_struct *vma)
 	else if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
 		reclaim_flags = __GFP_DIRECT_RECLAIM;
 
-	return GFP_TRANSHUGE | reclaim_flags;
+	return GFP_TRANSHUGE | __GFP_THISNODE | reclaim_flags;
 }
 
 /* Defrag for khugepaged will enter direct reclaim/compaction if necessary */
@@ -1130,9 +1130,11 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			pmdp_set_wrprotect(src_mm, addr, src_pmd);
 			pmd = pmd_wrprotect(pmd);
 		} else {
+			int nr_pages;	/* not interesting here */
+
 			VM_BUG_ON_PAGE(!PageTeam(src_page), src_page);
 			page_dup_rmap(src_page, false);
-			inc_team_pmd_mapped(src_page);
+			inc_team_pmd_mapped(src_page, &nr_pages);
 		}
 		add_mm_counter(dst_mm, mm_counter(src_page), HPAGE_PMD_NR);
 		atomic_long_inc(&dst_mm->nr_ptes);
@@ -1443,8 +1445,8 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 		touch_pmd(vma, addr, pmd);
 	if ((flags & FOLL_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
 		/*
-		 * We don't mlock() pte-mapped THPs. This way we can avoid
-		 * leaking mlocked pages into non-VM_LOCKED VMAs.
+		 * We don't mlock() pte-mapped compound THPs. This way we
+		 * can avoid leaking mlocked pages into non-VM_LOCKED VMAs.
 		 *
 		 * In most cases the pmd is the only mapping of the page as we
 		 * break COW for the mlock() -- see gup_flags |= FOLL_WRITE for
@@ -1453,12 +1455,16 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 		 * The only scenario when we have the page shared here is if we
 		 * mlocking read-only mapping shared over fork(). We skip
 		 * mlocking such pages.
+		 *
+		 * But the huge tmpfs PageTeam case is handled differently:
+		 * there are no arbitrary restrictions on mlocking such pages,
+		 * and compound_mapcount() returns 0 even when they are mapped.
 		 */
-		if (compound_mapcount(page) == 1 && !PageDoubleMap(page) &&
+		if (compound_mapcount(page) <= 1 && !PageDoubleMap(page) &&
 				page->mapping && trylock_page(page)) {
 			lru_add_drain();
 			if (page->mapping)
-				mlock_vma_page(page);
+				mlock_vma_pages(page, HPAGE_PMD_NR);
 			unlock_page(page);
 		}
 	}
@@ -1710,6 +1716,9 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		pte_free(tlb->mm, pgtable_trans_huge_withdraw(tlb->mm, pmd));
 		atomic_long_dec(&tlb->mm->nr_ptes);
 		spin_unlock(ptl);
+		if (PageTeam(page) &&
+		    !team_pmd_mapped(page) && team_pmd_mlocked(page))
+			clear_pages_mlock(page, HPAGE_PMD_NR);
 		tlb_remove_page(tlb, page);
 	}
 	return 1;
@@ -3492,18 +3501,44 @@ late_initcall(split_huge_pages_debugfs);
 
 static void page_add_team_rmap(struct page *page)
 {
+	int nr_pages;
+
 	VM_BUG_ON_PAGE(PageAnon(page), page);
 	VM_BUG_ON_PAGE(!PageTeam(page), page);
-	if (inc_team_pmd_mapped(page))
-		__inc_zone_page_state(page, NR_SHMEM_PMDMAPPED);
+
+	lock_page_memcg(page);
+	if (inc_team_pmd_mapped(page, &nr_pages)) {
+		struct zone *zone = page_zone(page);
+
+		__inc_zone_state(zone, NR_SHMEM_PMDMAPPED);
+		__mod_zone_page_state(zone, NR_FILE_MAPPED, nr_pages);
+		mem_cgroup_update_page_stat(page,
+				MEM_CGROUP_STAT_FILE_MAPPED, nr_pages);
+		mem_cgroup_update_page_stat(page,
+				MEM_CGROUP_STAT_SHMEM_PMDMAPPED, HPAGE_PMD_NR);
+	}
+	unlock_page_memcg(page);
 }
 
 static void page_remove_team_rmap(struct page *page)
 {
+	int nr_pages;
+
 	VM_BUG_ON_PAGE(PageAnon(page), page);
 	VM_BUG_ON_PAGE(!PageTeam(page), page);
-	if (dec_team_pmd_mapped(page))
-		__dec_zone_page_state(page, NR_SHMEM_PMDMAPPED);
+
+	lock_page_memcg(page);
+	if (dec_team_pmd_mapped(page, &nr_pages)) {
+		struct zone *zone = page_zone(page);
+
+		__dec_zone_state(zone, NR_SHMEM_PMDMAPPED);
+		__mod_zone_page_state(zone, NR_FILE_MAPPED, -nr_pages);
+		mem_cgroup_update_page_stat(page,
+				MEM_CGROUP_STAT_FILE_MAPPED, -nr_pages);
+		mem_cgroup_update_page_stat(page,
+				MEM_CGROUP_STAT_SHMEM_PMDMAPPED, -HPAGE_PMD_NR);
+	}
+	unlock_page_memcg(page);
 }
 
 int map_team_by_pmd(struct vm_area_struct *vma, unsigned long addr,
@@ -3668,6 +3703,93 @@ void remap_team_by_ptes(struct vm_area_struct *vma, unsigned long addr,
 		spin_unlock(ptl);
 	pte_unmap(pte);
 raced:
+	spin_unlock(pml);
+	mmu_notifier_invalidate_range_end(mm, addr, end);
+}
+
+void remap_team_by_pmd(struct vm_area_struct *vma, unsigned long addr,
+		       pmd_t *pmd, struct page *head)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct page *page = head;
+	pgtable_t pgtable;
+	unsigned long end;
+	spinlock_t *pml;
+	spinlock_t *ptl;
+	pmd_t pmdval;
+	pte_t *pte;
+	int rss = 0;
+
+	VM_BUG_ON_PAGE(!PageTeam(head), head);
+	VM_BUG_ON_PAGE(!PageLocked(head), head);
+	VM_BUG_ON(addr & ~HPAGE_PMD_MASK);
+	end = addr + HPAGE_PMD_SIZE;
+
+	mmu_notifier_invalidate_range_start(mm, addr, end);
+	pml = pmd_lock(mm, pmd);
+	pmdval = *pmd;
+	/* I don't see how this can happen now, but be defensive */
+	if (pmd_trans_huge(pmdval) || pmd_none(pmdval))
+		goto out;
+
+	ptl = pte_lockptr(mm, pmd);
+	if (ptl != pml)
+		spin_lock(ptl);
+
+	pgtable = pmd_pgtable(pmdval);
+	pmdval = mk_pmd(head, vma->vm_page_prot);
+	pmdval = pmd_mkhuge(pmd_mkdirty(pmdval));
+
+	/* Perhaps wise to mark head as mapped before removing pte rmaps */
+	page_add_file_rmap(head);
+
+	/*
+	 * Just as remap_team_by_ptes() would prefer to fill the page table
+	 * earlier, remap_team_by_pmd() would prefer to empty it later; but
+	 * ppc64's variant of the deposit/withdraw protocol prevents that.
+	 */
+	pte = pte_offset_map(pmd, addr);
+	do {
+		if (pte_none(*pte))
+			continue;
+
+		VM_BUG_ON(!pte_present(*pte));
+		VM_BUG_ON(pte_page(*pte) != page);
+
+		pte_clear(mm, addr, pte);
+		page_remove_rmap(page, false);
+		put_page(page);
+		rss++;
+	} while (pte++, page++, addr += PAGE_SIZE, addr != end);
+
+	pte -= HPAGE_PMD_NR;
+	addr -= HPAGE_PMD_SIZE;
+
+	if (rss) {
+		pmdp_collapse_flush(vma, addr, pmd);
+		pgtable_trans_huge_deposit(mm, pmd, pgtable);
+		set_pmd_at(mm, addr, pmd, pmdval);
+		update_mmu_cache_pmd(vma, addr, pmd);
+		get_page(head);
+		page_add_team_rmap(head);
+		add_mm_counter(mm, MM_SHMEMPAGES, HPAGE_PMD_NR - rss);
+	} else {
+		/*
+		 * Hmm.  We might have caught this vma in between unmap_vmas()
+		 * and free_pgtables(), which is a surprising time to insert a
+		 * huge page.  Before our caller checked mm_users, I sometimes
+		 * saw a "bad pmd" report, and pgtable_pmd_page_dtor() BUG on
+		 * pmd_huge_pte, when killing off tests.  But checking mm_users
+		 * is not enough to protect against munmap(): so for safety,
+		 * back out if we found no ptes to replace.
+		 */
+		page_remove_rmap(head, false);
+	}
+
+	if (ptl != pml)
+		spin_unlock(ptl);
+	pte_unmap(pte);
+out:
 	spin_unlock(pml);
 	mmu_notifier_invalidate_range_end(mm, addr, end);
 }

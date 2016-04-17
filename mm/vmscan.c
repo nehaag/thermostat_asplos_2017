@@ -19,6 +19,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/swap.h>
 #include <linux/pagemap.h>
+#include <linux/pageteam.h>
 #include <linux/init.h>
 #include <linux/highmem.h>
 #include <linux/vmpressure.h>
@@ -1512,6 +1513,39 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
 			putback_lru_page(page);
 			spin_lock_irq(&zone->lru_lock);
 			continue;
+		}
+
+		if (PageTeam(page) && !PageActive(page)) {
+			struct page *head = team_head(page);
+			struct address_space *mapping;
+			bool transferring_weight = false;
+			/*
+			 * Team tail page was ready for eviction, but has
+			 * been sent back from shmem_writepage(): transfer
+			 * its weight to head, and move tail to unevictable.
+			 */
+			mapping = READ_ONCE(page->mapping);
+			if (page != head && mapping) {
+				lruvec = mem_cgroup_page_lruvec(head, zone);
+				spin_lock(&mapping->tree_lock);
+				if (PageTeam(head)) {
+					VM_BUG_ON(head->mapping != mapping);
+					inc_lru_weight(head);
+					transferring_weight = true;
+				}
+				spin_unlock(&mapping->tree_lock);
+			}
+			if (transferring_weight) {
+				if (PageLRU(head))
+					update_lru_size(lruvec,
+							page_lru(head), 1);
+				/* Get this tail page out of the way for now */
+				SetPageUnevictable(page);
+				clear_lru_weight(page);
+			} else {
+				/* Traditional case of unswapped & redirtied */
+				SetPageActive(page);
+			}
 		}
 
 		lruvec = mem_cgroup_page_lruvec(page, zone);
@@ -3651,8 +3685,12 @@ static inline unsigned long zone_unmapped_file_pages(struct zone *zone)
 	/*
 	 * It's possible for there to be more file mapped pages than
 	 * accounted for by the pages on the file LRU lists because
-	 * tmpfs pages accounted for as ANON can also be FILE_MAPPED
+	 * tmpfs pages accounted for as ANON can also be FILE_MAPPED.
+	 * We don't know how many, beyond the PMDMAPPED excluded below.
 	 */
+	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		file_mapped -= zone_page_state(zone, NR_SHMEM_PMDMAPPED) <<
+							HPAGE_PMD_ORDER;
 	return (file_lru > file_mapped) ? (file_lru - file_mapped) : 0;
 }
 
@@ -3791,11 +3829,12 @@ int zone_reclaim(struct zone *zone, gfp_t gfp_mask, unsigned int order)
  * Reasons page might not be evictable:
  * (1) page's mapping marked unevictable
  * (2) page is part of an mlocked VMA
- *
+ * (3) page is held in memory as part of a team
  */
 int page_evictable(struct page *page)
 {
-	return !mapping_unevictable(page_mapping(page)) && !PageMlocked(page);
+	return !mapping_unevictable(page_mapping(page)) &&
+		!PageMlocked(page) && hpage_nr_pages(page);
 }
 
 #ifdef CONFIG_SHMEM

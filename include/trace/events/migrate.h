@@ -9,7 +9,8 @@
 #define MIGRATE_MODE						\
 	EM( MIGRATE_ASYNC,	"MIGRATE_ASYNC")		\
 	EM( MIGRATE_SYNC_LIGHT,	"MIGRATE_SYNC_LIGHT")		\
-	EMe(MIGRATE_SYNC,	"MIGRATE_SYNC")
+	EM( MIGRATE_SYNC,	"MIGRATE_SYNC")			\
+	EMe(MIGRATE_SHMEM_RECOVERY, "MIGRATE_SHMEM_RECOVERY")
 
 
 #define MIGRATE_REASON						\
@@ -20,7 +21,8 @@
 	EM( MR_MEMPOLICY_MBIND,	"mempolicy_mbind")		\
 	EM( MR_NUMA_MISPLACED,	"numa_misplaced")		\
 	EM( MR_CMA,		"cma")				\
-	EMe(MR_SHMEM_HUGEHOLE,	"shmem_hugehole")
+	EM( MR_SHMEM_HUGEHOLE,	"shmem_hugehole")		\
+	EMe(MR_SHMEM_RECOVERY,	"shmem_recovery")
 
 /*
  * First define the enums in the above macros to be exported to userspace

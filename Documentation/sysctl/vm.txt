@@ -57,6 +57,9 @@ Currently, these files are in /proc/sys/vm:
 - panic_on_oom
 - percpu_pagelist_fraction
 - shmem_huge
+- shmem_huge_gfpmask
+- shmem_huge_recoveries
+- shmem_recovery_gfpmask
 - stat_interval
 - stat_refresh
 - swappiness
@@ -761,6 +764,33 @@ to force huge off for all (intended for safety if bugs appeared).
 
 See Documentation/filesystems/tmpfs.txt for info on huge tmpfs.
 /proc/sys/vm/shmem_huge is intended for experimentation only.
+
+==============================================================
+
+shmem_huge_gfpmask
+
+Write a gfpmask built from __GFP flags in include/linux/gfp.h, to experiment
+with better alternatives for the synchronous huge tmpfs allocation used
+when faulting or writing.  See Documentation/filesystems/tmpfs.txt.
+/proc/sys/vm/shmem_huge_gfpmask is intended for experimentation only.
+
+==============================================================
+
+shmem_huge_recoveries
+
+Default 8, allows up to 8 concurrent workitems, recovering hugepages
+after fragmentation prevented or reclaim disbanded; write 0 to disable
+huge recoveries, or a higher number to allow more concurrent recoveries
+(or a negative number to disable both retry after shrinking, and recovery).
+
+==============================================================
+
+shmem_recovery_gfpmask
+
+Write a gfpmask built from __GFP flags in include/linux/gfp.h, to experiment
+with alternatives for the asynchronous huge tmpfs allocation used in recovery
+from fragmentation or swapping.  See Documentation/filesystems/tmpfs.txt.
+/proc/sys/vm/shmem_recovery_gfpmask is intended for experimentation only.
 
 ==============================================================
 

@@ -23,6 +23,7 @@
 #include <linux/pagevec.h>
 #include <linux/ksm.h>
 #include <linux/rmap.h>
+#include <linux/shmem_fs.h>
 #include <linux/topology.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
@@ -371,6 +372,15 @@ int migrate_page_move_mapping(struct address_space *mapping,
 		return -EAGAIN;
 	}
 
+	if (mode == MIGRATE_SHMEM_RECOVERY) {
+		if (!shmem_recovery_migrate_page(newpage, page)) {
+			page_ref_unfreeze(page, expected_count);
+			spin_unlock_irq(&mapping->tree_lock);
+			return -ENOMEM;	/* quit migrate_pages() immediately */
+		}
+	} else
+		get_page(newpage);	/* add cache reference */
+
 	/*
 	 * Now we know that no one else is looking at the page:
 	 * no turning back from here.
@@ -380,7 +390,6 @@ int migrate_page_move_mapping(struct address_space *mapping,
 	if (PageSwapBacked(page))
 		__SetPageSwapBacked(newpage);
 
-	get_page(newpage);	/* add cache reference */
 	if (PageSwapCache(page)) {
 		SetPageSwapCache(newpage);
 		set_page_private(newpage, page_private(page));
@@ -813,6 +822,17 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 			goto out;
 
 		lock_page(page);
+	}
+
+	/*
+	 * huge tmpfs recovery: must not proceed if page has been truncated,
+	 * because the newpage we are about to migrate into *might* then be
+	 * already in use, on lru, with data newly written for that offset.
+	 * We can only be sure of this check once we have the page locked.
+	 */
+	if (mode == MIGRATE_SHMEM_RECOVERY && !page->mapping) {
+		rc = -ENOMEM;	/* quit migrate_pages() immediately */
+		goto out_unlock;
 	}
 
 	if (PageWriteback(page)) {
