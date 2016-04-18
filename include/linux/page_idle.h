@@ -103,7 +103,7 @@ static inline void set_page_idle(struct page *page)
 {
 }
 
-#ifdef CONFIG_KSTALED
+#ifndef CONFIG_KSTALED
 static inline void clear_page_idle(struct page *page)
 {
 }

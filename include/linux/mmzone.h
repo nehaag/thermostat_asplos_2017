@@ -670,7 +670,6 @@ typedef struct pglist_data {
                                          each page was referenced */
 #endif
  	int node_id;
-	int node_id;
 	wait_queue_head_t kswapd_wait;
 	wait_queue_head_t pfmemalloc_wait;
 	struct task_struct *kswapd;	/* Protected by

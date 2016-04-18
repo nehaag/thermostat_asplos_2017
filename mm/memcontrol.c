@@ -4499,6 +4499,7 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.read_s64 = mem_cgroup_num_hot_page_threshold_read,
 		.write_s64 = mem_cgroup_num_hot_page_threshold_write,
 	}, 
+    {
 		.name = "cold_memory_fraction",
 		.read_s64 = mem_cgroup_cold_memory_fraction_read,
 		.write_s64 = mem_cgroup_cold_memory_fraction_write,
