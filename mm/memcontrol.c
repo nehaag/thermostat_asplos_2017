@@ -3883,27 +3883,32 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "total_cold_faults %llu\n",
             atomic64_read(&memcg->total_cold_faults));
     /* Print page access distribution */
-    seq_printf(sf, "num_access_distribution\n");
+    seq_printf(sf, "num_access_distribution ");
     for (bucket = 0; bucket < 50; bucket++) {
         seq_printf(sf, "%u ", memcg->num_access_distribution_printed[bucket]);
     }
     seq_printf(sf, "\n");
 
     /* Print page access distribution */
-    seq_printf(sf, "page_access_distribution\n");
+    seq_printf(sf, "page_access_distribution ");
     for (bucket = 0; bucket < 513; bucket++) {
         seq_printf(sf, "%u ", memcg->page_access_distribution[bucket]);
     }
     seq_printf(sf, "\n");
 
-    seq_printf(sf, "access_corr\n");
-    for (bucket = 0; bucket < 11; bucket++) {
-        for(bucket2 = 0; bucket2 < 11; bucket2++) {
-            seq_printf(sf, "%u ", memcg->access_corr_printed[bucket][bucket2]);
-        }
-        seq_printf(sf, "\n");
-    }
-    seq_printf(sf, "\n");
+    seq_printf(sf, "num_hot_page_threshold_adaptive %d\n",
+            memcg->num_hot_page_threshold_adaptive);
+    seq_printf(sf, "num_cold_page_threshold_adaptive %d\n",
+            memcg->num_cold_page_threshold_adaptive);
+
+//    seq_printf(sf, "access_corr\n");
+//    for (bucket = 0; bucket < 11; bucket++) {
+//        for(bucket2 = 0; bucket2 < 11; bucket2++) {
+//            seq_printf(sf, "%u ", memcg->access_corr_printed[bucket][bucket2]);
+//        }
+//        seq_printf(sf, "\n");
+//    }
+//    seq_printf(sf, "\n");
 #endif /* CONFIG_POISON_PAGE */
 
     return 0;
@@ -3950,8 +3955,10 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
 
     memcg->enable_poison_page = val;
     memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
+    memset(memcg->page_access_cummulative_distribution, 0,
+            513 * sizeof(unsigned int));
     memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
-    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+//    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
     memcg->num_cold_bytes = 0;
     memcg->num_cold_bytes_printed = 0;
     memcg->num_cold_huge_bytes = 0;
@@ -3972,6 +3979,8 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     atomic64_set(&memcg->cold_fault_time, 0);
     atomic64_set(&memcg->total_cold_faults, 0);
     memcg->num_badgerTrap_faults_sampled_printed = 0;
+    memcg->num_hot_page_threshold_adaptive = memcg->num_hot_page_threshold;
+    memcg->num_cold_page_threshold_adaptive = memcg->num_cold_page_threshold;
 
     return 0;
 }
@@ -4099,6 +4108,27 @@ static int mem_cgroup_num_hot_page_threshold_write(struct cgroup_subsys_state *c
         return -EINVAL;
 
     memcg->num_hot_page_threshold = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_cold_memory_fraction_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->cold_memory_fraction;
+}
+
+static int mem_cgroup_cold_memory_fraction_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->cold_memory_fraction = val;
 
     return 0;
 }
@@ -4469,6 +4499,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.read_s64 = mem_cgroup_num_hot_page_threshold_read,
 		.write_s64 = mem_cgroup_num_hot_page_threshold_write,
 	}, 
+		.name = "cold_memory_fraction",
+		.read_s64 = mem_cgroup_cold_memory_fraction_read,
+		.write_s64 = mem_cgroup_cold_memory_fraction_write,
+	},
     {
 		.name = "hot_small_page_threshold",
 		.read_s64 = mem_cgroup_hot_small_page_threshold_read,
@@ -6749,7 +6783,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * Tag huge page as cold/hot or if huge page is a hotspot page,
                  * tag small pages inside it as cold/hot.
                  */
-                if (num_hot_small_pages >= memcg->num_hot_page_threshold) {
+                if (num_hot_small_pages >=
+                        memcg->num_hot_page_threshold_adaptive) {
                     /* This huge page is HOT, so we should collapse it. */
                     page->in_sampling_state = 0;
                     page->is_page_cold = false;
@@ -6758,7 +6793,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         struct page *small_page = page + offset;
                         small_page->is_page_cold = false;
                     }
-                } else if(num_hot_small_pages < memcg->num_cold_page_threshold) {
+                } else if(num_hot_small_pages <
+                        memcg->num_cold_page_threshold_adaptive) {
                     /*
                      * This huge page is COLD, collapse this as well. Also
                      * poison it so that accesses to this page are slowed down
@@ -6784,7 +6820,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         struct page *small_page = page + offset;
                         int read_num_accesses = atomic_read(&small_page->num_accesses);
 
-                        if (read_num_accesses <= memcg->hotspot_hot_page_threshold) {
+                        if (read_num_accesses < memcg->hotspot_hot_page_threshold) {
                             /* poison this small page */
                             page_poison(small_page, is_locked, NULL, true);
                             small_page->is_page_cold = true;
@@ -6824,17 +6860,21 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     && !PageHuge(page)
                     && !is_huge_zero_page(page)) {
 
-                /*
-                 * Split the huge page PMD, but not the struct page. This is
-                 * done to simplify race conditions with VM page accounting and
-                 * simplify reference count mechanism.
-                 */
-                int split_successful = page_split_for_sampling(page, is_locked);
-
-                /* Set sampling bit in the page after checking that page has
-                 * been actually split. */
-                if(split_successful) {
+                if (page->is_page_split) {
                     page->in_sampling_state = 1;
+                } else {
+                    /*
+                     * Split the huge page PMD, but not the struct page. This is
+                     * done to simplify race conditions with VM page accounting and
+                     * simplify reference count mechanism.
+                     */
+                    int split_successful = page_split_for_sampling(page, is_locked);
+
+                    /* Set sampling bit in the page after checking that page has
+                     * been actually split. */
+                    if(split_successful) {
+                        page->in_sampling_state = 1;
+                    }
                 }
             } else {
                 /* Reset smapling bit in the page. */
@@ -7002,7 +7042,6 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 {
     struct idle_page_stats tot;
     int i;
-    int start_new_sampling_period;
 
     memset(&tot, 0, sizeof(tot));
 
@@ -7019,6 +7058,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     write_seqcount_end(&memcg->idle_page_stats_lock);
 
     memset(&memcg->idle_scan_stats, 0, sizeof(memcg->idle_scan_stats));
+
+#ifdef CONFIG_POISON_PAGE
     memcg->num_cold_bytes_printed = memcg->num_cold_bytes;
     memcg->num_cold_bytes = 0;
     memcg->num_cold_huge_bytes_printed = memcg->num_cold_huge_bytes;
@@ -7045,9 +7086,45 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             memcg->num_access_distribution, 50 * sizeof(unsigned int));
 //    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
 
-    memcpy(memcg->access_corr_printed, 
-            memcg->access_corr, 11 * 11 * sizeof(unsigned int));
-    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+//    memcpy(memcg->access_corr_printed, 
+//            memcg->access_corr, 11 * 11 * sizeof(unsigned int));
+//    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+    /*
+     * Cumulative page access distribution for approximating
+     * num_hot_page_threshold. Assume we will serve (cold_memory_fraction)% of accesses
+     * from slow memory, calculate the threshold for which
+     * cumulative accesses are equal to cold_memory_fraction.
+     *
+     * Update adaptive thresholds every sampling period. Reset
+     * page_access_distribution.
+     */
+    if (memcg->poison_sampling_period == 0 ||
+            ((memcg->idle_page_scans % memcg->poison_sampling_period) == 0)) {
+        int offset;
+        int access_fraction;
+        memcg->page_access_cummulative_distribution[0] =
+            memcg->page_access_distribution[0];
+        for (offset = 1; offset < 513; offset++) {
+            memcg->page_access_cummulative_distribution[offset] =
+                memcg->page_access_cummulative_distribution[offset - 1]
+                + memcg->page_access_distribution[offset];
+        }
+
+        for (offset = 0; offset < 513; offset++) {
+            access_fraction =
+                (memcg->page_access_cummulative_distribution[offset]
+                 * 100)
+                / (memcg->page_access_cummulative_distribution[512]
+                        + 1);
+            if (access_fraction >= memcg->cold_memory_fraction) {
+                memcg->num_hot_page_threshold_adaptive = offset;
+                memcg->num_cold_page_threshold_adaptive = 0;
+                break;
+            }
+        }
+        memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
+    }
+#endif /* CONFIG_POISON_PAGE */
 }
 
 static int kstaled(void *dummy)

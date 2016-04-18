@@ -298,11 +298,15 @@ struct mem_cgroup {
     unsigned int poison_sampling_ratio;
     unsigned int poison_sampling_period;
     unsigned int page_access_distribution[513];
+    unsigned int page_access_cummulative_distribution[513];
     unsigned int slow_memory_latency_ns;
-    int num_cold_page_threshold;
     int hot_small_page_threshold;
     int hotspot_hot_page_threshold;
     int num_hot_page_threshold;
+    int num_cold_page_threshold;
+    int num_hot_page_threshold_adaptive;
+    int num_cold_page_threshold_adaptive;
+    int cold_memory_fraction;
     unsigned long num_cold_bytes;
     unsigned long num_cold_bytes_printed;
     unsigned long num_cold_huge_bytes;
@@ -323,8 +327,8 @@ struct mem_cgroup {
     int num_badgerTrap_huge_faults_cold_printed;
     atomic_t num_badgerTrap_faults_sampled;
     int num_badgerTrap_faults_sampled_printed;
-    unsigned int access_corr[11][11];
-    unsigned int access_corr_printed[11][11];
+//    unsigned int access_corr[11][11];
+//    unsigned int access_corr_printed[11][11];
 #endif
 
 	struct mem_cgroup_per_node *nodeinfo[0];
