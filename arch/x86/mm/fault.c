@@ -23,9 +23,14 @@
 #include <asm/vsyscall.h>		/* emulate_vsyscall		*/
 #include <asm/vm86.h>			/* struct vm86			*/
 #include <asm/mmu_context.h>		/* vma_pkey()			*/
+#include <asm/msr.h>		    /* rdtsc() */
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
+#include <linux/memcontrol.h>
+
+extern inline pte_t pte_unreserve(pte_t pte);
+extern inline pmd_t pmd_unreserve(pmd_t pmd);
 
 /*
  * Page fault error code bits:
@@ -697,8 +702,8 @@ pgtable_bad(struct pt_regs *regs, unsigned long error_code,
 	tsk = current;
 	sig = SIGKILL;
 
-	printk(KERN_ALERT "%s: Corrupted page table at address %lx\n",
-	       tsk->comm, address);
+	printk(KERN_ALERT "%s: %d Corrupted page table at address %lx\n",
+	       tsk->comm, tsk->pid, address);
 	dump_pagetable(address);
 
 	tsk->thread.cr2		= address;
@@ -1103,7 +1108,8 @@ NOKPROBE_SYMBOL(spurious_fault);
 int show_unhandled_signals = 1;
 
 static inline int
-access_error(unsigned long error_code, struct vm_area_struct *vma)
+access_error(unsigned long error_code, struct vm_area_struct *vma,
+		int is_mem_cgroup_poison_page)
 {
 	/* This is only called for the current mm, so: */
 	bool foreign = false;
@@ -1124,8 +1130,12 @@ access_error(unsigned long error_code, struct vm_area_struct *vma)
 	}
 
 	/* read, present: */
-	if (unlikely(error_code & PF_PROT))
-		return 1;
+	if (unlikely(error_code & PF_PROT)) {
+        if((error_code & PF_RSVD) && is_mem_cgroup_poison_page == 1)
+            return 0;
+        else
+            return 1;
+    }
 
 	/* read, not present: */
 	if (unlikely(!(vma->vm_flags & (VM_READ | VM_EXEC | VM_WRITE))))
@@ -1174,6 +1184,23 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	struct mm_struct *mm;
 	int fault, major = 0;
 	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
+
+    pgd_t *base;
+    pgd_t *pgd;
+    pmd_t *pmd;
+    pte_t *pte;
+    spinlock_t *ptl;
+
+    unsigned long long start_time = rdtsc_ordered();
+    unsigned long long end_time;
+
+#ifdef CONFIG_POISON_PAGE
+    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(current->mm);
+    css_put(&memcg->css);
+    int is_mem_cgroup_poison_page = mem_cgroup_poison_page(memcg);
+#else
+    int is_mem_cgroup_poison_page = 0;
+#endif
 
 	tsk = current;
 	mm = tsk->mm;
@@ -1231,8 +1258,33 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	if (unlikely(kprobes_fault(regs)))
 		return;
 
-	if (unlikely(error_code & PF_RSVD))
-		pgtable_bad(regs, error_code, address);
+    if (unlikely(error_code & PF_RSVD)
+            && is_mem_cgroup_poison_page == 0) {
+#ifndef CONFIG_POISON_PAGE
+        pgtable_bad(regs, error_code, address);
+#else
+        /* Un reserve the PTE */
+        base = __va(read_cr3());
+        pgd = &base[pgd_index(address)];
+        pmd = pmd_offset(pud_offset(pgd, address), address);
+
+        /* Insert support for THP and hugetlbfs */
+        if (pmd_trans_huge(*pmd)) {
+            ptl = pmd_lockptr(mm, pmd);
+            spin_lock(ptl);
+            *pmd = pmd_unreserve(*pmd);
+            spin_unlock(ptl);
+        } else {
+            pte = pte_offset_map_lock(mm, pmd, address, &ptl);
+            *pte = pte_unreserve(*pte);
+            pte_unmap_unlock(pte, ptl);
+        }
+
+        /* Reset reserved bit in error code*/
+        error_code &= ~PF_RSVD;
+        return;
+#endif
+    }
 
 	if (unlikely(smap_violation(error_code, regs))) {
 		bad_area_nosemaphore(regs, error_code, address, NULL);
@@ -1337,7 +1389,7 @@ retry:
 	 * we can handle it..
 	 */
 good_area:
-	if (unlikely(access_error(error_code, vma))) {
+	if (unlikely(access_error(error_code, vma, is_mem_cgroup_poison_page))) {
 		bad_area_access_error(regs, error_code, address, vma);
 		return;
 	}
@@ -1350,6 +1402,13 @@ good_area:
 	 */
 	fault = handle_mm_fault(mm, vma, address, flags);
 	major |= fault & VM_FAULT_MAJOR;
+
+    end_time = rdtsc_ordered();
+#ifdef CONFIG_POISON_PAGE
+    if (is_mem_cgroup_poison_page && (error_code & PF_RSVD)) {
+        mem_cgroup_increment_fault_time(memcg, end_time-start_time);
+    }
+#endif
 
 	/*
 	 * If we need to retry the mmap_sem has already been released,

@@ -35,6 +35,7 @@
 #include <linux/memcontrol.h>
 #include <linux/cgroup.h>
 #include <linux/mm.h>
+#include <linux/huge_mm.h>
 #include <linux/hugetlb.h>
 #include <linux/pagemap.h>
 #include <linux/pageteam.h>
@@ -64,6 +65,9 @@
 #include <linux/lockdep.h>
 #include <linux/file.h>
 #include <linux/tracehook.h>
+#include <linux/kthread.h>
+#include <linux/rmap.h>
+#include <linux/vmalloc.h>
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -384,6 +388,44 @@ ino_t page_cgroup_ino(struct page *page)
 	rcu_read_unlock();
 	return ino;
 }
+
+#ifdef CONFIG_POISON_PAGE
+unsigned int mem_cgroup_poison_page(struct mem_cgroup *memcg)
+{
+    return memcg->enable_poison_page;
+}
+
+void mem_cgroup_increment_fault_time(struct mem_cgroup *memcg,
+        unsigned long long fault_time)
+{
+    atomic64_add(fault_time, &memcg->cold_fault_time);
+    atomic64_inc(&memcg->total_cold_faults);
+}
+
+unsigned int mem_cgroup_slow_memory_latency_ns(struct mem_cgroup *memcg)
+{
+    return memcg->slow_memory_latency_ns;
+}
+
+int mem_cgroup_cold_page_threshold(struct mem_cgroup *memcg)
+{
+    return memcg->num_cold_page_threshold;
+}
+
+int mem_cgroup_hot_page_threshold(struct mem_cgroup *memcg)
+{
+    return memcg->num_hot_page_threshold;
+}
+
+void mem_cgroup_inc_num_badgerTrap_faults(struct mem_cgroup *memcg,
+        bool is_huge)
+{
+    if (is_huge)
+        atomic_inc(&memcg->num_badgerTrap_huge_faults_cold);
+    else
+        atomic_inc(&memcg->num_badgerTrap_faults_cold);
+}
+#endif /* CONFIG_POISON_PAGE */
 
 static struct mem_cgroup_per_zone *
 mem_cgroup_page_zoneinfo(struct mem_cgroup *memcg, struct page *page)
@@ -744,7 +786,7 @@ struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p)
 }
 EXPORT_SYMBOL(mem_cgroup_from_task);
 
-static struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
+struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
 {
 	struct mem_cgroup *memcg = NULL;
 
@@ -3785,6 +3827,324 @@ static int memcg_event_wake(wait_queue_t *wait, unsigned mode,
 	return 0;
 }
 
+#ifdef CONFIG_KSTALED
+static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+    unsigned int seqcount;
+    struct idle_page_stats stats[NUM_KSTALED_BUCKETS];
+    unsigned long scans;
+    int bucket, bucket2;
+
+    do {
+        seqcount = read_seqcount_begin(&memcg->idle_page_stats_lock);
+        memcpy(stats, memcg->idle_page_stats, sizeof(stats));
+        scans = memcg->idle_page_scans;
+    } while (read_seqcount_retry(&memcg->idle_page_stats_lock, seqcount));
+
+    for (bucket = 0; bucket < NUM_KSTALED_BUCKETS; bucket++) {
+        char basename[32], name[32];
+        if (!bucket)
+            sprintf(basename, "idle");
+        else
+            sprintf(basename, "idle_%d", kstaled_buckets[bucket]);
+        sprintf(name, "%s_clean", basename);
+        seq_printf(sf, "%s %lu\n", name, stats[bucket].idle_clean * PAGE_SIZE);
+        sprintf(name, "%s_dirty_file", basename);
+        seq_printf(sf, "%s %lu\n", name, stats[bucket].idle_dirty_file * PAGE_SIZE);
+        sprintf(name, "%s_dirty_swap", basename);
+        seq_printf(sf, "%s %lu\n", name, stats[bucket].idle_dirty_swap * PAGE_SIZE);
+    }
+    seq_printf(sf, "scans %lu\n", scans);
+    seq_printf(sf, "stale %lu\n",
+            max(atomic_long_read(&memcg->stale_pages), 0L) * PAGE_SIZE);
+
+#ifdef CONFIG_POISON_PAGE
+    /* Print number of cold bytes*/
+    seq_printf(sf, "num_cold_bytes %lu\n", memcg->num_cold_bytes_printed);
+    seq_printf(sf, "num_cold_huge_bytes %lu\n", memcg->num_cold_huge_bytes_printed);
+    seq_printf(sf, "num_hot_bytes %lu\n", memcg->num_hot_bytes_printed);
+    seq_printf(sf, "num_hot_huge_bytes %lu\n", memcg->num_hot_huge_bytes_printed);
+    seq_printf(sf, "num_sampled_bytes %lu\n", memcg->num_sampled_bytes_printed);
+    seq_printf(sf, "num_scanned_bytes %lu\n", memcg->num_scanned_bytes_printed);
+    seq_printf(sf, "diff_scanned_hot_cold_bytes %ld\n",
+            memcg->num_scanned_bytes_printed -
+            (memcg->num_cold_bytes_printed + memcg->num_cold_huge_bytes_printed +
+             memcg->num_hot_bytes_printed + memcg->num_hot_huge_bytes_printed));
+    seq_printf(sf, "num_badgerTrap_faults_cold %d\n",
+            memcg->num_badgerTrap_faults_cold_printed);
+    seq_printf(sf, "num_badgerTrap_huge_faults_cold %d\n",
+            memcg->num_badgerTrap_huge_faults_cold_printed);
+    seq_printf(sf, "num_badgerTrap_faults_sampled %d\n",
+            memcg->num_badgerTrap_faults_sampled_printed);
+
+    seq_printf(sf, "cold_fault_time %llu\n",
+            atomic64_read(&memcg->cold_fault_time));
+    seq_printf(sf, "total_cold_faults %llu\n",
+            atomic64_read(&memcg->total_cold_faults));
+    /* Print page access distribution */
+    seq_printf(sf, "num_access_distribution\n");
+    for (bucket = 0; bucket < 50; bucket++) {
+        seq_printf(sf, "%u ", memcg->num_access_distribution_printed[bucket]);
+    }
+    seq_printf(sf, "\n");
+
+    /* Print page access distribution */
+    seq_printf(sf, "page_access_distribution\n");
+    for (bucket = 0; bucket < 513; bucket++) {
+        seq_printf(sf, "%u ", memcg->page_access_distribution[bucket]);
+    }
+    seq_printf(sf, "\n");
+
+    seq_printf(sf, "access_corr\n");
+    for (bucket = 0; bucket < 11; bucket++) {
+        for(bucket2 = 0; bucket2 < 11; bucket2++) {
+            seq_printf(sf, "%u ", memcg->access_corr_printed[bucket][bucket2]);
+        }
+        seq_printf(sf, "\n");
+    }
+    seq_printf(sf, "\n");
+#endif /* CONFIG_POISON_PAGE */
+
+    return 0;
+}
+
+static u64 mem_cgroup_stale_page_age_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->stale_page_age;
+}
+
+static int mem_cgroup_stale_page_age_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val > 255)
+        return -EINVAL;
+
+    memcg->stale_page_age = val;
+
+    return 0;
+}
+#endif /* CONFIG_KSTALED */
+
+#ifdef CONFIG_POISON_PAGE
+static u64 mem_cgroup_enable_poison_page_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->enable_poison_page;
+}
+
+static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->enable_poison_page = val;
+    memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
+    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
+    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+    memcg->num_cold_bytes = 0;
+    memcg->num_cold_bytes_printed = 0;
+    memcg->num_cold_huge_bytes = 0;
+    memcg->num_cold_huge_bytes_printed = 0;
+    memcg->num_hot_bytes = 0;
+    memcg->num_hot_bytes_printed = 0;
+    memcg->num_hot_huge_bytes = 0;
+    memcg->num_hot_huge_bytes_printed = 0;
+    memcg->num_sampled_bytes = 0;
+    memcg->num_sampled_bytes_printed = 0;
+    memcg->num_scanned_bytes = 0;
+    memcg->num_scanned_bytes_printed = 0;
+    atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
+    memcg->num_badgerTrap_faults_cold_printed = 0;
+    atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
+    memcg->num_badgerTrap_huge_faults_cold_printed = 0;
+    atomic_set(&memcg->num_badgerTrap_faults_sampled, 0);
+    atomic64_set(&memcg->cold_fault_time, 0);
+    atomic64_set(&memcg->total_cold_faults, 0);
+    memcg->num_badgerTrap_faults_sampled_printed = 0;
+
+    return 0;
+}
+
+static u64 mem_cgroup_enable_split_page_read(struct cgroup_subsys_state *css,
+
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->enable_split_page;
+}
+
+static int mem_cgroup_enable_split_page_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->enable_split_page = val;
+
+    return 0;
+}
+
+static u64 mem_cgroup_poison_sampling_ratio_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->poison_sampling_ratio;
+}
+
+static int mem_cgroup_poison_sampling_ratio_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0 || val > 100)
+        return -EINVAL;
+
+    memcg->poison_sampling_ratio = val;
+
+    return 0;
+}
+
+static u64 mem_cgroup_poison_sampling_period_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->poison_sampling_period;
+}
+
+static int mem_cgroup_poison_sampling_period_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0 || val > 100)
+        return -EINVAL;
+
+    memcg->poison_sampling_period = val;
+
+    return 0;
+}
+
+static u64 mem_cgroup_slow_memory_latency_ns_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->slow_memory_latency_ns;
+}
+
+static int mem_cgroup_slow_memory_latency_ns_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->slow_memory_latency_ns = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_num_cold_page_threshold_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->num_cold_page_threshold;
+}
+
+static int mem_cgroup_num_cold_page_threshold_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->num_cold_page_threshold = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_num_hot_page_threshold_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->num_hot_page_threshold;
+}
+
+static int mem_cgroup_num_hot_page_threshold_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->num_hot_page_threshold = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_hot_small_page_threshold_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->hot_small_page_threshold;
+}
+
+static int mem_cgroup_hot_small_page_threshold_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->hot_small_page_threshold = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_hotspot_hot_page_threshold_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+    return memcg->hotspot_hot_page_threshold;
+}
+
+static int mem_cgroup_hotspot_hot_page_threshold_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->hotspot_hot_page_threshold = val;
+
+    return 0;
+}
+#endif /* CONFIG_POISON_PAGE */
+
 static void memcg_event_ptable_queue_proc(struct file *file,
 		wait_queue_head_t *wqh, poll_table *pt)
 {
@@ -4062,6 +4422,64 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.write = mem_cgroup_reset,
 		.read_u64 = mem_cgroup_read_u64,
 	},
+#ifdef CONFIG_KSTALED
+	{
+		.name = "idle_page_stats",
+		.seq_show= mem_cgroup_idle_page_stats_read,
+	},
+	{
+		.name = "stale_page_age",
+		.read_u64 = mem_cgroup_stale_page_age_read,
+		.write_u64 = mem_cgroup_stale_page_age_write,
+	},
+#endif /* CONFIG_KSTALED */
+#ifdef CONFIG_POISON_PAGE
+    {
+		.name = "enable_poison_page",
+		.read_u64 = mem_cgroup_enable_poison_page_read,
+		.write_u64 = mem_cgroup_enable_poison_page_write,
+	},
+    {
+		.name = "enable_split_page",
+		.read_u64 = mem_cgroup_enable_split_page_read,
+		.write_u64 = mem_cgroup_enable_split_page_write,
+	},
+    {
+		.name = "poison_sampling_ratio",
+		.read_u64 = mem_cgroup_poison_sampling_ratio_read,
+		.write_u64 = mem_cgroup_poison_sampling_ratio_write,
+	},
+    {
+		.name = "poison_sampling_period",
+		.read_u64 = mem_cgroup_poison_sampling_period_read,
+		.write_u64 = mem_cgroup_poison_sampling_period_write,
+	},
+    {
+		.name = "slow_memory_latency_ns",
+		.read_u64 = mem_cgroup_slow_memory_latency_ns_read,
+		.write_u64 = mem_cgroup_slow_memory_latency_ns_write,
+	},
+    {
+		.name = "num_cold_page_threshold",
+		.read_s64 = mem_cgroup_num_cold_page_threshold_read,
+		.write_s64 = mem_cgroup_num_cold_page_threshold_write,
+	}, 
+    {
+		.name = "num_hot_page_threshold",
+		.read_s64 = mem_cgroup_num_hot_page_threshold_read,
+		.write_s64 = mem_cgroup_num_hot_page_threshold_write,
+	}, 
+    {
+		.name = "hot_small_page_threshold",
+		.read_s64 = mem_cgroup_hot_small_page_threshold_read,
+		.write_s64 = mem_cgroup_hot_small_page_threshold_write,
+	}, 
+    {
+		.name = "hotspot_hot_page_threshold",
+		.read_s64 = mem_cgroup_hotspot_hot_page_threshold_read,
+		.write_s64 = mem_cgroup_hotspot_hot_page_threshold_write,
+	}, 
+#endif /* CONFIG_POISON_PAGE */
 	{ },	/* terminate */
 };
 
@@ -4149,6 +4567,9 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 #endif
 #ifdef CONFIG_CGROUP_WRITEBACK
 	INIT_LIST_HEAD(&memcg->cgwb_list);
+#endif
+#ifdef CONFIG_KSTALED
+    seqcount_init(&memcg->idle_page_stats_lock);
 #endif
 	return memcg;
 fail:
@@ -4568,6 +4989,13 @@ static int mem_cgroup_move_account(struct page *page,
 	memcg_check_events(to, page);
 	mem_cgroup_charge_statistics(from, page, compound, -nr_pages);
 	memcg_check_events(from, page);
+
+#ifdef CONFIG_KSTALED
+    /* Count page as non-stale */
+    if (PageStale(page) && TestClearPageStale(page))
+        atomic_long_dec(&from->stale_pages);
+#endif
+
 	local_irq_enable();
 out_unlock:
 	unlock_page(page);
@@ -6056,5 +6484,679 @@ static int __init mem_cgroup_swap_init(void)
 	return 0;
 }
 subsys_initcall(mem_cgroup_swap_init);
+
+#ifdef CONFIG_KSTALED
+
+static unsigned int kstaled_scan_seconds;
+static DECLARE_WAIT_QUEUE_HEAD(kstaled_wait);
+
+    static inline struct idle_page_stats *
+kstaled_idle_stats(struct mem_cgroup *memcg, int age)
+{
+    int bucket = 0;
+
+    while (age >= kstaled_buckets[bucket + 1])
+        if (++bucket == NUM_KSTALED_BUCKETS - 1)
+            break;
+    return memcg->idle_scan_stats + bucket;
+}
+
+static void __update_memcg_hot_cold_bytes(struct page* page,
+        struct mem_cgroup* memcg)
+{
+    unsigned offset;
+    for (offset = 0; offset < 512; offset++) {
+        struct page *small_page = page + offset;
+        if (small_page->is_page_cold)
+            memcg->num_cold_bytes += 4096;
+        else
+            memcg->num_hot_bytes += 4096;
+    }
+}
+
+static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
+{
+    bool is_locked = false;
+    bool is_file;
+    struct page_referenced_info info;
+    struct page_cgroup *pc;
+    struct mem_cgroup *memcg = NULL;
+    int age;
+    struct idle_page_stats *stats;
+    unsigned nr_pages = 1;
+
+    /*
+     * Before taking the page reference, check if the page is
+     * a user page which is not obviously unreclaimable
+     * (we will do more complete checks later).
+     */
+    if (!PageLRU(page) ||
+            (!PageCompound(page) &&
+             (PageMlocked(page) ||
+              (page->mapping == NULL && !PageSwapCache(page)))))
+        return 1;
+
+    if (!get_page_unless_zero(page))
+        return 1;
+
+    /* Recheck now that we have the page reference. */
+    if (unlikely(!PageLRU(page)))
+        goto out;
+    nr_pages = 1 << compound_order(page);
+    if (PageMlocked(page))
+        goto out;
+
+    /*
+     * Anon and SwapCache pages can be identified without locking.
+     * For all other cases, we need the page locked in order to
+     * dereference page->mapping.
+     */
+    if (PageAnon(page) || PageSwapCache(page))
+        is_file = false;
+    else if (!trylock_page(page)) {
+        /*
+         * We need to lock the page to dereference the mapping.
+         * But don't risk sleeping by calling lock_page().
+         * We don't want to stall kstaled, so we conservatively
+         * count locked pages as unreclaimable.
+         */
+        goto out;
+    } else {
+        struct address_space *mapping = page->mapping;
+
+        is_locked = true;
+
+        /*
+         * The page is still anon - it has been continuously referenced
+         * since the prior check.
+         */
+        VM_BUG_ON(PageAnon(page) || mapping != page_rmapping(page));
+
+        /*
+         * Check the mapping under protection of the page lock.
+         * 1. If the page is not swap cache and has no mapping,
+         *    shrink_page_list can't do anything with it.
+         * 2. If the mapping is unevictable (as in SHM_LOCK segments),
+         *    shrink_page_list can't do anything with it.
+         * 3. If the page is swap cache or the mapping is swap backed
+         *    (as in shmem), consider it a swappable page.
+         * 4. If the backing dev has indicated that it does not want
+         *    its pages sync'd to disk (as in ramfs), take this as
+         *    a hint that its pages are not reclaimable.
+         * 5. Otherwise, consider this as a file page reclaimable
+         *    through standard pageout.
+         */
+        if (!mapping && !PageSwapCache(page))
+            goto out;
+        else if (mapping_unevictable(mapping, page))
+            goto out;
+        else if (PageSwapCache(page))
+            is_file = false;
+        else if (!mapping_cap_writeback_dirty(mapping))
+            goto out;
+        else
+            is_file = true;
+    }
+
+    /* Find out if the page is idle. Also test for pending mlock. */
+    page_referenced_kstaled(page, is_locked, &info);
+
+#ifdef CONFIG_POISON_PAGE
+    /* Locate if poison bit is enabled for the page's mem_cgroup. */
+    if (!page->mem_cgroup)
+        goto resume_kstaled_work;
+    //    lock_page_cgroup(pc);
+    memcg = page->mem_cgroup;
+    unsigned int start_new_sampling_period = 0;
+    unsigned int offset = 0;
+
+
+#ifdef CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE
+    /* Our aim is to get the distribution of 4KB accesses within a 2MB page.
+     * Sampling strategy: Choose x% of pages to sample based on a hash
+     * function. Feed in 2MB aligned virtual address to the hash function.
+     * Different physical 4KB pages can be mapped to different 4KB virtual
+     * addresses, therefore we need virtual address and then align it to
+     * 2MB. Here x=5 ~= 100/19, which means 100/19  percent 2MB pages to be
+     * sampled in the virtual address range.
+     * */
+
+    if (memcg->enable_poison_page) {
+        if (!page->is_first_kstaled_scan_done ||
+                page->is_page_selected_for_locality_analysis)
+            page_poison(page, is_locked, NULL, true);
+
+        page->is_first_kstaled_scan_done = true;
+    }
+#else /* !CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE */
+
+    if (memcg->enable_poison_page) {
+
+        /*
+         * Count the number of cold bytes in the given page in a given kstaled
+         * scan period. Take care of the fact that a struct page which is
+         * PageTransHuge may actually have been split (can be found out by
+         * page->is_page_split).
+         */
+        if (page->is_page_cold) {
+            /* Page is COLD. */
+            if (PageTransHuge(page)) {
+                if (page->is_page_split) {
+                    /* Page is huge but has split pmd. */
+                    __update_memcg_hot_cold_bytes(page, memcg);
+                } else {
+                    memcg->num_cold_huge_bytes += 2097152;
+                }
+            } else {
+                memcg->num_cold_bytes += 4096;
+            }
+        } else {
+            /* Page is HOT. */
+            if (PageTransHuge(page)) {
+                if (page->is_page_split) {
+                    /* Page is huge but has split pmd. */
+                    __update_memcg_hot_cold_bytes(page, memcg);
+                } else {
+                    memcg->num_hot_huge_bytes += 2097152;
+                }
+            } else {
+                memcg->num_hot_bytes += 4096;
+            }
+        }
+
+        /*
+         * Here we do not need to take into account the is_page_split flag since
+         * regardless of whether the page is split or not we are scanning and
+         * sampling the same number of bytes.
+         */
+        if (page->in_sampling_state)
+            memcg->num_sampled_bytes += PageTransHuge(page) ? 2097152 : 4096;
+
+        memcg->num_scanned_bytes += PageTransHuge(page) ? 2097152 : 4096;
+
+        /*
+         * Sample the pages to be splitted. Split a random number of pages
+         * (based on sampling ratio) for a given sample period.
+         * poison_sampling_period = 0 means we are sampling new pages every
+         * kstaled scan period.
+         * start_new_sampling_period = 1 means we are in the sampling phase to
+         * choose new set of pages to split.
+         */
+        if (memcg->poison_sampling_period == 0) {
+            start_new_sampling_period = 1;
+        } else {
+            start_new_sampling_period = !(memcg->idle_page_scans %
+                    memcg->poison_sampling_period);
+        }
+
+        /*
+         * Before sampling new set of pages for this sampling period, tag pages
+         * as cold, hot, or hotspot according to the num_accesses collected in
+         * the *previous* sampling period.
+         * Heuristics to decide whether page is cold or hot or hotspot:
+         * TODO
+         */
+        if (start_new_sampling_period) {
+            /*
+             * Find out if the page has been sampled in the *previous* sampling
+             * period.
+             */
+            if (page->in_sampling_state) {
+
+                /*
+                 * We have only sampled huge pages. Suddenly they should not
+                 * have become non-huge pages.
+                 */
+                WARN_ON(!PageTransHuge(page));
+
+                /*
+                 * Reset the page to not be in sampling state. We will sample
+                 * new set of pages below.
+                 */
+                page->in_sampling_state = 0;
+
+                /*
+                 * Count the number of hot small pages in this 2MB page. Hot is
+                 * defined as num_accesses >= hot_small_page_threshold over the
+                 * entire sampling period.
+                 */
+                int num_hot_small_pages = 0;
+                for (offset = 0; offset < 512; offset++) {
+                    struct page *small_page = page + offset;
+                    int read_num_accesses = atomic_read(&small_page->num_accesses);
+                    if (read_num_accesses >= memcg->hot_small_page_threshold) {
+                        num_hot_small_pages++;
+                    }
+
+                    /*
+                     * Update the num_access_distribution histogram in the memcg
+                     * with the number of accesses of this small page. The
+                     * histogram is clipped at 49 accesses.
+                     */
+                    int bin_number = read_num_accesses;
+                    if (bin_number >= 49)
+                        bin_number = 49;
+                    memcg->num_access_distribution[bin_number]++;
+                }
+
+                /*
+                 * We also maintain a distribution of how many hot small pages
+                 * were found in each sampled huge page.
+                 */
+                memcg->page_access_distribution[num_hot_small_pages]++;
+
+                /*
+                 * Tag huge page as cold/hot or if huge page is a hotspot page,
+                 * tag small pages inside it as cold/hot.
+                 */
+                if (num_hot_small_pages >= memcg->num_hot_page_threshold) {
+                    /* This huge page is HOT, so we should collapse it. */
+                    page->in_sampling_state = 0;
+                    page->is_page_cold = false;
+                    page_collapse_to_huge(page, is_locked, false);
+                    for (offset = 0; offset < 512; offset++) {
+                        struct page *small_page = page + offset;
+                        small_page->is_page_cold = false;
+                    }
+                } else if(num_hot_small_pages < memcg->num_cold_page_threshold) {
+                    /*
+                     * This huge page is COLD, collapse this as well. Also
+                     * poison it so that accesses to this page are slowed down
+                     * by badgertrap.
+                     */
+                    page->is_page_cold = true;
+                    page->in_sampling_state = 0;
+                    page_collapse_to_huge(page, is_locked, true);
+                    for (offset = 0; offset < 512; offset++) {
+                        struct page *small_page = page + offset;
+                        small_page->is_page_cold = true;
+                    }
+                } else {
+                    /*
+                     * This huge page is hotspot. Since the huge page PMD is
+                     * already split, we don't need to do any further splitting.
+                     * Tag the small pages as hot or cold based on if its
+                     * num_accesses is > or <= hotspot_hot_page_threshold.
+                     * Also poison the "cold" small pages so that accesses to
+                     * this page are slowed down by badgertrap.
+                     */
+                    for (offset = 0; offset < 512; offset++) {
+                        struct page *small_page = page + offset;
+                        int read_num_accesses = atomic_read(&small_page->num_accesses);
+
+                        if (read_num_accesses <= memcg->hotspot_hot_page_threshold) {
+                            /* poison this small page */
+                            page_poison(small_page, is_locked, NULL, true);
+                            small_page->is_page_cold = true;
+                        } else {
+                            small_page->is_page_cold = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        /*
+         * Generate a random number between 0 and 100 which will be used to
+         * decide whether this page is sampled in this sampling period or not.
+         */
+        unsigned int random_number;
+        get_random_bytes(&random_number, sizeof(int));
+        random_number %= 100;
+
+        /*
+         * Sample the new set of huge pages for this sampling period, and split
+         * the PMDs for those huge pages.
+         */
+        if (start_new_sampling_period) {
+            /*
+             * Sample this page if:
+             * a) the random_number is < sampling_ratio (we are sampling
+             * sampling_ratio percentage of huge pages),
+             * b) it is anonymous,
+             * c) it is a transparent huge page,
+             * d) it is not a HugeTLBFS page (determined by !PageHuge(page)),
+             * e) it is not the zero page.
+             */
+            if (random_number < memcg->poison_sampling_ratio
+                    && PageAnon(page)
+                    && PageTransHuge(page)
+                    && !PageHuge(page)
+                    && !is_huge_zero_page(page)) {
+
+                /*
+                 * Split the huge page PMD, but not the struct page. This is
+                 * done to simplify race conditions with VM page accounting and
+                 * simplify reference count mechanism.
+                 */
+                int split_successful = page_split_for_sampling(page, is_locked);
+
+                /* Set sampling bit in the page after checking that page has
+                 * been actually split. */
+                if(split_successful) {
+                    page->in_sampling_state = 1;
+                }
+            } else {
+                /* Reset smapling bit in the page. */
+                page->in_sampling_state = 0;
+            }
+
+            /*
+             * Reset number of accesses to the page to 0, since this is the
+             * beginning of a new sampling period. Also, reset for the small
+             * pages in this huge page as we want to record num_accesses to
+             * those small pages.
+             */
+            atomic_set(&page->num_accesses, 0);
+            for (offset = 0; offset < 512; offset++) {
+                atomic_set(&page[offset].num_accesses, 0);
+            }
+        }
+    }
+
+    //    unlock_page_cgroup(pc);
+#endif /* CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE */
+#endif /* CONFIG_POISON_PAGE */
+
+resume_kstaled_work:
+    /*
+     * TODO: This is kstaled page age accounting logic. Figure out if we need
+     * this, and if we do, if we need to fix this.
+     */
+    if ((info.pr_flags & PR_REFERENCED) || (info.vm_flags & VM_LOCKED)) {
+        *idle_page_age = 0;
+        goto out;
+    }
+
+    /* Locate kstaled stats for the page's cgroup. */
+    if (!page->mem_cgroup)
+        goto out;
+//    lock_page_cgroup(pc);
+    memcg = page->mem_cgroup;
+//    if (!PageCgroupUsed(pc))
+//        goto unlock_page_cgroup_out;
+
+    /* Page is idle, increment its age and get the right stats bucket */
+    age = *idle_page_age;
+    if (age < 255)
+        *idle_page_age = ++age;
+    stats = kstaled_idle_stats(memcg, age);
+
+    /* Finally increment the correct statistic for this page. */
+    if (!(info.pr_flags & PR_DIRTY) &&
+            !PageDirty(page) && !PageWriteback(page)) {
+        stats->idle_clean += nr_pages;
+
+        /* THP pages are currently always accounted for as dirty... */
+        VM_BUG_ON(nr_pages != 1);
+        if (memcg->stale_page_age && age >= memcg->stale_page_age) {
+            if (!PageStale(page) && !TestSetPageStale(page))
+                atomic_long_inc(&memcg->stale_pages);
+            goto unlock_page_cgroup_out;
+        }
+    } else if (is_file)
+        stats->idle_dirty_file += nr_pages;
+    else
+        stats->idle_dirty_swap += nr_pages;
+
+    /* Count page as non-stale */
+    if (PageStale(page) && TestClearPageStale(page)) {
+        VM_BUG_ON(nr_pages != 1);
+        atomic_long_dec(&memcg->stale_pages);
+    }
+
+unlock_page_cgroup_out:
+//    unlock_page_cgroup(pc);
+
+out:
+    if (is_locked)
+        unlock_page(page);
+    put_page(page);
+
+    return nr_pages;
+}
+
+void __set_page_nonstale(struct page *page)
+{
+    struct mem_cgroup *memcg;
+
+    /* Locate kstaled stats for the page's cgroup. */
+    if (!page->mem_cgroup)
+        return;
+//    lock_page_cgroup(pc);
+    memcg = page->mem_cgroup;
+//    if (!PageCgroupUsed(pc))
+//        goto out;
+
+    /* Count page as non-stale */
+    if (TestClearPageStale(page))
+        atomic_long_dec(&memcg->stale_pages);
+
+//out:
+//    unlock_page_cgroup(pc);
+}
+
+static bool kstaled_scan_node(pg_data_t *pgdat, int scan_seconds, bool reset)
+{
+    unsigned long flags;
+    unsigned long pfn, end, node_end;
+    u8 *idle_page_age;
+
+    pgdat_resize_lock(pgdat, &flags);
+
+    if (!pgdat->node_idle_page_age) {
+        pgdat->node_idle_page_age = vmalloc(pgdat->node_spanned_pages);
+        if (!pgdat->node_idle_page_age) {
+            pgdat_resize_unlock(pgdat, &flags);
+            return false;
+        }
+        memset(pgdat->node_idle_page_age, 0, pgdat->node_spanned_pages);
+    }
+
+    pfn = pgdat->node_start_pfn;
+    node_end = pfn + pgdat->node_spanned_pages;
+    idle_page_age = pgdat->node_idle_page_age - pfn;
+    if (!reset && pfn < pgdat->node_idle_scan_pfn)
+        pfn = pgdat->node_idle_scan_pfn;
+    end = min(pfn + DIV_ROUND_UP(pgdat->node_spanned_pages, scan_seconds),
+            node_end);
+
+    while (pfn < end) {
+        unsigned long contiguous = end;
+
+        /* restrict pfn..contiguous to be a RAM backed range */
+        pfn_skip_hole(&pfn, &contiguous);
+
+        while (pfn < contiguous) {
+            if (need_resched()) {
+                pgdat_resize_unlock(pgdat, &flags);
+                cond_resched();
+                pgdat_resize_lock(pgdat, &flags);
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+                /* abort if the node got resized */
+                if (pfn < pgdat->node_start_pfn ||
+                        node_end > (pgdat->node_start_pfn +
+                            pgdat->node_spanned_pages) ||
+                        !pgdat->node_idle_page_age)
+                    goto abort;
+#endif
+            }
+
+            pfn += pfn_valid(pfn) ?
+                kstaled_scan_page(pfn_to_page(pfn),
+                        idle_page_age + pfn) : 1;
+        }
+    }
+
+abort:
+    pgdat_resize_unlock(pgdat, &flags);
+
+    pgdat->node_idle_scan_pfn = min(pfn, end);
+    return pfn >= node_end;
+}
+
+static void kstaled_update_stats(struct mem_cgroup *memcg)
+{
+    struct idle_page_stats tot;
+    int i;
+    int start_new_sampling_period;
+
+    memset(&tot, 0, sizeof(tot));
+
+    write_seqcount_begin(&memcg->idle_page_stats_lock);
+    for (i = NUM_KSTALED_BUCKETS - 1; i >= 0; i--) {
+        struct idle_page_stats *idle_scan_bucket;
+        idle_scan_bucket = memcg->idle_scan_stats + i;
+        tot.idle_clean      += idle_scan_bucket->idle_clean;
+        tot.idle_dirty_file += idle_scan_bucket->idle_dirty_file;
+        tot.idle_dirty_swap += idle_scan_bucket->idle_dirty_swap;
+        memcg->idle_page_stats[i] = tot;
+    }
+    memcg->idle_page_scans++;
+    write_seqcount_end(&memcg->idle_page_stats_lock);
+
+    memset(&memcg->idle_scan_stats, 0, sizeof(memcg->idle_scan_stats));
+    memcg->num_cold_bytes_printed = memcg->num_cold_bytes;
+    memcg->num_cold_bytes = 0;
+    memcg->num_cold_huge_bytes_printed = memcg->num_cold_huge_bytes;
+    memcg->num_cold_huge_bytes = 0;
+    memcg->num_hot_bytes_printed = memcg->num_hot_bytes;
+    memcg->num_hot_bytes = 0;
+    memcg->num_hot_huge_bytes_printed = memcg->num_hot_huge_bytes;
+    memcg->num_hot_huge_bytes = 0;
+    memcg->num_sampled_bytes_printed = memcg->num_sampled_bytes;
+    memcg->num_sampled_bytes = 0;
+    memcg->num_scanned_bytes_printed = memcg->num_scanned_bytes;
+    memcg->num_scanned_bytes = 0;
+    memcg->num_badgerTrap_faults_cold_printed = atomic_read(
+            &memcg->num_badgerTrap_faults_cold);
+    atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
+    memcg->num_badgerTrap_huge_faults_cold_printed = atomic_read(
+            &memcg->num_badgerTrap_huge_faults_cold);
+    atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
+    memcg->num_badgerTrap_faults_sampled_printed = atomic_read(
+            &memcg->num_badgerTrap_faults_sampled);
+    atomic_set(&memcg->num_badgerTrap_faults_sampled, 0);
+
+    memcpy(memcg->num_access_distribution_printed, 
+            memcg->num_access_distribution, 50 * sizeof(unsigned int));
+    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
+
+    memcpy(memcg->access_corr_printed, 
+            memcg->access_corr, 11 * 11 * sizeof(unsigned int));
+    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+}
+
+static int kstaled(void *dummy)
+{
+    bool reset = true;
+    long deadline = jiffies;
+
+    while (1) {
+        int scan_seconds;
+        int nid;
+        long delta;
+        bool scan_done;
+
+        deadline += HZ;
+        scan_seconds = kstaled_scan_seconds;
+        if (scan_seconds <= 0) {
+            wait_event_interruptible(kstaled_wait,
+                    (scan_seconds = kstaled_scan_seconds) > 0);
+            deadline = jiffies + HZ;
+        }
+
+        /*
+         * We use interruptible wait_event so as not to contribute
+         * to the machine load average while we're sleeping.
+         * However, we don't actually expect to receive a signal
+         * since we run as a kernel thread, so the condition we were
+         * waiting for should be true once we get here.
+         */
+        BUG_ON(scan_seconds <= 0);
+
+        scan_done = true;
+        for_each_node_state(nid, N_HIGH_MEMORY)
+            scan_done &= kstaled_scan_node(NODE_DATA(nid),
+                    scan_seconds, reset);
+
+        if (scan_done) {
+            struct mem_cgroup *memcg;
+
+            for_each_mem_cgroup(memcg)
+                kstaled_update_stats(memcg);
+        }
+
+        delta = jiffies - deadline;
+        if (delta < 0)
+            schedule_timeout_interruptible(-delta);
+        else if (delta >= HZ)
+            pr_warning("kstaled running %ld.%02d seconds late\n",
+                    delta / HZ, (int)(delta % HZ) * 100 / HZ);
+
+        reset = scan_done;
+    }
+
+    BUG();
+    return 0;	/* NOT REACHED */
+}
+
+static ssize_t kstaled_scan_seconds_show(struct kobject *kobj,
+        struct kobj_attribute *attr,
+        char *buf)
+{
+    return sprintf(buf, "%u\n", kstaled_scan_seconds);
+}
+
+static ssize_t kstaled_scan_seconds_store(struct kobject *kobj,
+        struct kobj_attribute *attr,
+        const char *buf, size_t count)
+{
+    int err;
+    unsigned long input;
+
+    err = kstrtoul(buf, 10, &input);
+    if (err)
+        return -EINVAL;
+    kstaled_scan_seconds = input;
+    wake_up_interruptible(&kstaled_wait);
+    return count;
+}
+
+static struct kobj_attribute kstaled_scan_seconds_attr = __ATTR(
+        scan_seconds, 0644,
+        kstaled_scan_seconds_show, kstaled_scan_seconds_store);
+
+static struct attribute *kstaled_attrs[] = {
+    &kstaled_scan_seconds_attr.attr,
+    NULL
+};
+static struct attribute_group kstaled_attr_group = {
+    .name = "kstaled",
+    .attrs = kstaled_attrs,
+};
+
+static int __init kstaled_init(void)
+{
+    int error;
+    struct task_struct *thread;
+
+    error = sysfs_create_group(mm_kobj, &kstaled_attr_group);
+    if (error) {
+        pr_err("Failed to create kstaled sysfs node\n");
+        return error;
+    }
+
+    thread = kthread_run(kstaled, NULL, "kstaled");
+    if (IS_ERR(thread)) {
+        pr_err("Failed to start kstaled\n");
+        return PTR_ERR(thread);
+    }
+
+    return 0;
+}
+module_init(kstaled_init);
+#endif /* CONFIG_KSTALED */
 
 #endif /* CONFIG_MEMCG_SWAP */

@@ -652,6 +652,7 @@ void do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+    static DEFINE_MUTEX(result_mutex);
 	TASKS_RCU(int tasks_rcu_i);
 
 	profile_task_exit(tsk);

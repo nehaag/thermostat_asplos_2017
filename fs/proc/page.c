@@ -200,6 +200,10 @@ u64 stable_page_flags(struct page *page)
 	u |= kpf_copy_bit(k, KPF_OWNER_PRIVATE,	PG_owner_priv_1);
 	u |= kpf_copy_bit(k, KPF_ARCH,		PG_arch_1);
 
+#ifdef CONFIG_KSTALED
+    u |= kpf_copy_bit(k, KPF_STALE,         PG_stale);
+#endif
+
 	return u;
 };
 

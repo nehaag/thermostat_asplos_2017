@@ -47,11 +47,14 @@ static inline void mapping_clear_unevictable(struct address_space *mapping)
 	clear_bit(AS_UNEVICTABLE, &mapping->flags);
 }
 
-static inline int mapping_unevictable(struct address_space *mapping)
+static inline int mapping_unevictable(struct address_space *mapping,
+		struct page *page)
 {
-	if (mapping)
-		return test_bit(AS_UNEVICTABLE, &mapping->flags);
-	return !!mapping;
+    if (mapping && test_bit(AS_UNEVICTABLE, &mapping->flags)) {
+        set_page_nonstale(page);
+        return 1;
+    }
+    return 0;
 }
 
 static inline void mapping_set_exiting(struct address_space *mapping)

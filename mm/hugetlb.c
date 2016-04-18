@@ -52,6 +52,10 @@ static struct hstate * __initdata parsed_hstate;
 static unsigned long __initdata default_hstate_max_huge_pages;
 static unsigned long __initdata default_hstate_size;
 
+extern inline pte_t pte_mkreserve(pte_t pte);
+extern inline pte_t pte_unreserve(pte_t pte);
+extern inline int is_pte_reserved(pte_t pte);
+
 /*
  * Protects updates to hugepage_freelists, hugepage_activelist, nr_huge_pages,
  * free_huge_pages, and surplus_huge_pages.
@@ -3314,7 +3318,8 @@ static void unmap_ref_private(struct mm_struct *mm, struct vm_area_struct *vma,
  */
 static int hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
 			unsigned long address, pte_t *ptep, pte_t pte,
-			struct page *pagecache_page, spinlock_t *ptl)
+			struct page *pagecache_page, spinlock_t *ptl,
+            unsigned int flags)
 {
 	struct hstate *h = hstate_vma(vma);
 	struct page *old_page, *new_page;
@@ -3595,7 +3600,7 @@ retry:
 	hugetlb_count_add(pages_per_huge_page(h), mm);
 	if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
 		/* Optimization, do the COW without a second fault */
-		ret = hugetlb_cow(mm, vma, address, ptep, new_pte, page, ptl);
+		ret = hugetlb_cow(mm, vma, address, ptep, new_pte, page, ptl, flags);
 	}
 
 	spin_unlock(ptl);
@@ -3646,6 +3651,36 @@ u32 hugetlb_fault_mutex_hash(struct hstate *h, struct mm_struct *mm,
 }
 #endif
 
+static int hugetlb_fake_fault(struct mm_struct *mm,
+        struct vm_area_struct *vma,
+        unsigned long address, pte_t *page_table, unsigned int flags)
+{
+    static unsigned int consecutive = 0;
+    static unsigned long prev_address = 0;
+
+    if(address == prev_address)
+        consecutive++;
+    else
+    {
+        consecutive = 0;
+        prev_address = address;
+    }
+
+    if(consecutive > 1)
+    {
+        *page_table = pte_unreserve(*page_table);
+        return 0;
+    }
+
+    if(flags & FAULT_FLAG_WRITE)
+        *page_table = huge_pte_mkdirty(*page_table);
+
+    *page_table = pte_mkyoung(*page_table);
+    *page_table = pte_unreserve(*page_table);
+
+    return 0;
+}
+
 int hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 			unsigned long address, unsigned int flags)
 {
@@ -3660,9 +3695,48 @@ int hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 	struct address_space *mapping;
 	int need_wait_lock = 0;
 
+    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
+    css_put(&memcg->css);
+
 	address &= huge_page_mask(h);
 
 	ptep = huge_pte_offset(mm, address);
+
+#ifdef CONFIG_POISON_PAGE
+    /*
+     * Here we check for Huge page that are marked as reserved
+     */
+	if(mm && (mem_cgroup_poison_page(memcg) == 1) 
+            && (!(flags & FAULT_FLAG_INSTRUCTION)) && ptep)
+	{
+        mapping = vma->vm_file->f_mapping;
+        idx = vma_hugecache_offset(h, vma, address);
+
+        hash = hugetlb_fault_mutex_hash(h, mm, vma, mapping, idx, address);
+        mutex_lock(&hugetlb_fault_mutex_table[hash]);
+		entry = huge_ptep_get(ptep);
+        if((flags & FAULT_FLAG_WRITE) && is_pte_reserved(entry) 
+                && !huge_pte_write(entry) && pte_present(entry))
+        {
+            page = pte_page(entry);
+            get_page(page);
+            if (page != pagecache_page)
+                lock_page(page);
+            ptl = huge_pte_lockptr(h, mm, ptep);
+            spin_lock(ptl);
+            ret = hugetlb_cow(mm, vma, address, ptep, entry,
+                    pagecache_page, ptl, flags);
+            goto out_ptl;
+        }
+        if(is_pte_reserved(entry) && pte_present(entry))
+        {
+            ret = hugetlb_fake_fault(mm, vma, address, ptep, flags);
+            goto out_mutex;
+        }
+        mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+	}
+#endif
+
 	if (ptep) {
 		entry = huge_ptep_get(ptep);
 		if (unlikely(is_hugetlb_entry_migration(entry))) {
@@ -3750,7 +3824,7 @@ int hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (flags & FAULT_FLAG_WRITE) {
 		if (!huge_pte_write(entry)) {
 			ret = hugetlb_cow(mm, vma, address, ptep, entry,
-					pagecache_page, ptl);
+					pagecache_page, ptl, flags);
 			goto out_put_page;
 		}
 		entry = huge_pte_mkdirty(entry);

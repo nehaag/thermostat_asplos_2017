@@ -585,7 +585,8 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
 }
 
 void do_set_pte(struct vm_area_struct *vma, unsigned long address,
-		struct page *page, pte_t *pte, bool write, bool anon);
+		struct page *page, pte_t *pte, bool write, bool anon,
+        unsigned int flags);
 #endif
 
 /*
@@ -741,6 +742,16 @@ static inline void put_page(struct page *page)
 	if (unlikely(is_zone_device_page(page)))
 		put_zone_device_page(page);
 }
+
+#ifdef CONFIG_POISON_PAGE
+static inline void page_poison_reset(struct page *page)
+{
+    page->in_sampling_state = 0;
+//    bitmap_clear(page->pages_accessed_4KB, 0, 512);
+    page->is_page_cold = false;
+    atomic_set(&page->num_accesses, 0);
+}
+#endif
 
 #if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
 #define SECTION_IN_PAGE_FLAGS

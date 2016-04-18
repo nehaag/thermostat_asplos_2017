@@ -444,6 +444,12 @@ static void __meminit grow_pgdat_span(struct pglist_data *pgdat, unsigned long s
 
 	pgdat->node_spanned_pages = max(old_pgdat_end_pfn, end_pfn) -
 					pgdat->node_start_pfn;
+#ifdef CONFIG_KSTALED
+    if (pgdat->node_idle_page_age) {
+        vfree(pgdat->node_idle_page_age);
+        pgdat->node_idle_page_age = NULL;
+    }
+#endif
 }
 
 static int __meminit __add_zone(struct zone *zone, unsigned long phys_start_pfn)

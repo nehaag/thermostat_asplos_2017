@@ -2006,7 +2006,7 @@ void shmem_unlock_mapping(struct address_space *mapping)
 	/*
 	 * Minor point, but we might as well stop if someone else SHM_LOCKs it.
 	 */
-	while (!mapping_unevictable(mapping)) {
+	while (!mapping_unevictable(mapping, NULL)) {
 		/*
 		 * Avoid pagevec_lookup(): find_get_pages() returns 0 as if it
 		 * has finished, if it hits a row of PAGEVEC_SIZE swap entries.

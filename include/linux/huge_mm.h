@@ -14,7 +14,7 @@ extern void huge_pmd_set_accessed(struct mm_struct *mm,
 				  pmd_t orig_pmd, int dirty);
 extern int do_huge_pmd_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 			       unsigned long address, pmd_t *pmd,
-			       pmd_t orig_pmd);
+			       pmd_t orig_pmd, unsigned int flags);
 extern struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 					  unsigned long addr,
 					  pmd_t *pmd,

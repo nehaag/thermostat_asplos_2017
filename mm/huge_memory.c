@@ -36,6 +36,9 @@
 #include <asm/pgalloc.h>
 #include "internal.h"
 
+extern inline pmd_t pmd_mkreserve(pmd_t pmd);
+extern inline pte_t pte_mkreserve(pte_t pte);
+
 enum scan_result {
 	SCAN_FAIL,
 	SCAN_SUCCEED,
@@ -1179,7 +1182,8 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
 					unsigned long address,
 					pmd_t *pmd, pmd_t orig_pmd,
 					struct page *page,
-					unsigned long haddr)
+					unsigned long haddr,
+                    unsigned int flags)
 {
 	struct mem_cgroup *memcg;
 	spinlock_t *ptl;
@@ -1285,7 +1289,8 @@ out_free_pages:
 }
 
 int do_huge_pmd_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
-			unsigned long address, pmd_t *pmd, pmd_t orig_pmd)
+			unsigned long address, pmd_t *pmd, pmd_t orig_pmd,
+            unsigned int flags)
 {
 	spinlock_t *ptl;
 	int ret = 0;
@@ -1344,7 +1349,7 @@ alloc:
 			ret |= VM_FAULT_FALLBACK;
 		} else {
 			ret = do_huge_pmd_wp_page_fallback(mm, vma, address,
-					pmd, orig_pmd, page, haddr);
+					pmd, orig_pmd, page, haddr, flags);
 			if (ret & VM_FAULT_OOM) {
 				split_huge_pmd(vma, pmd, address);
 				ret |= VM_FAULT_FALLBACK;
@@ -1396,6 +1401,10 @@ alloc:
 		page_add_new_anon_rmap(new_page, vma, haddr, true);
 		mem_cgroup_commit_charge(new_page, memcg, false, true);
 		lru_cache_add_active_or_unevictable(new_page, vma);
+#ifdef CONFIG_POISON_PAGE
+        if (is_pmd_reserved(orig_pmd))
+            entry = pmd_mkreserve(entry);
+#endif
 		set_pmd_at(mm, haddr, pmd, entry);
 		update_mmu_cache_pmd(vma, address, pmd);
 		if (!page) {
@@ -2892,7 +2901,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	struct page *page;
 	pgtable_t pgtable;
 	pmd_t _pmd;
-	bool young, write, dirty;
+	bool young, write, dirty, reserved;
 	unsigned long addr;
 	int i;
 
@@ -2918,6 +2927,9 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	write = pmd_write(*pmd);
 	young = pmd_young(*pmd);
 	dirty = pmd_dirty(*pmd);
+#ifdef CONFIG_POISON_PAGE
+    reserved = is_pmd_reserved(*pmd) ? true : false;
+#endif
 
 	pmdp_huge_split_prepare(vma, haddr, pmd);
 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
@@ -2942,6 +2954,10 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			if (!young)
 				entry = pte_mkold(entry);
 		}
+#ifdef CONFIG_POISON_PAGE
+            if (reserved)
+                entry = pte_mkreserve(entry);
+#endif
 		if (dirty)
 			SetPageDirty(page + i);
 		pte = pte_offset_map(&_pmd, addr);

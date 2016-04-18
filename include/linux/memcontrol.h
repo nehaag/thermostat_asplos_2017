@@ -35,6 +35,11 @@ struct page;
 struct mm_struct;
 struct kmem_cache;
 
+#ifdef CONFIG_KSTALED
+static const int kstaled_buckets[] = {1, 2, 5, 15, 30, 60, 120, 240};
+#define NUM_KSTALED_BUCKETS ARRAY_SIZE(kstaled_buckets)
+#endif
+
 /*
  * The corresponding mem_cgroup_stat_names is defined in mm/memcontrol.c,
  * These two lists should keep in accord with each other.
@@ -271,6 +276,57 @@ struct mem_cgroup {
 	struct list_head event_list;
 	spinlock_t event_list_lock;
 
+#ifdef CONFIG_KSTALED
+	int stale_page_age;
+
+	seqcount_t idle_page_stats_lock;
+	struct idle_page_stats {
+		unsigned long idle_clean;
+		unsigned long idle_dirty_file;
+		unsigned long idle_dirty_swap;
+	} idle_page_stats[NUM_KSTALED_BUCKETS],
+	  idle_scan_stats[NUM_KSTALED_BUCKETS];
+	atomic_long_t stale_pages;
+	unsigned long idle_page_scans;
+#endif
+
+#ifdef CONFIG_POISON_PAGE
+    unsigned int enable_poison_page;
+    atomic64_t cold_fault_time;
+    atomic64_t total_cold_faults;
+    unsigned int enable_split_page;
+    unsigned int poison_sampling_ratio;
+    unsigned int poison_sampling_period;
+    unsigned int page_access_distribution[513];
+    unsigned int slow_memory_latency_ns;
+    int num_cold_page_threshold;
+    int hot_small_page_threshold;
+    int hotspot_hot_page_threshold;
+    int num_hot_page_threshold;
+    unsigned long num_cold_bytes;
+    unsigned long num_cold_bytes_printed;
+    unsigned long num_cold_huge_bytes;
+    unsigned long num_cold_huge_bytes_printed;
+    unsigned long num_hot_bytes;
+    unsigned long num_hot_bytes_printed;
+    unsigned long num_hot_huge_bytes;
+    unsigned long num_hot_huge_bytes_printed;
+    unsigned long num_sampled_bytes;
+    unsigned long num_sampled_bytes_printed;
+    unsigned long num_scanned_bytes;
+    unsigned long num_scanned_bytes_printed;
+    unsigned int num_access_distribution[50];
+    unsigned int num_access_distribution_printed[50];
+    atomic_t num_badgerTrap_faults_cold;
+    int num_badgerTrap_faults_cold_printed;
+    atomic_t num_badgerTrap_huge_faults_cold;
+    int num_badgerTrap_huge_faults_cold_printed;
+    atomic_t num_badgerTrap_faults_sampled;
+    int num_badgerTrap_faults_sampled_printed;
+    unsigned int access_corr[11][11];
+    unsigned int access_corr_printed[11][11];
+#endif
+
 	struct mem_cgroup_per_node *nodeinfo[0];
 	/* WARNING: nodeinfo must be the last member here */
 };
@@ -315,11 +371,23 @@ struct lruvec *mem_cgroup_page_lruvec(struct page *, struct zone *);
 
 bool task_in_mem_cgroup(struct task_struct *task, struct mem_cgroup *memcg);
 struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);
+extern struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
 
 static inline
 struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
 	return css ? container_of(css, struct mem_cgroup, css) : NULL;
 }
+
+#ifdef CONFIG_POISON_PAGE
+extern unsigned int mem_cgroup_poison_page(struct mem_cgroup *memcg);
+extern void mem_cgroup_increment_fault_time(struct mem_cgroup *memcg,
+        unsigned long long fault_time);
+extern unsigned int mem_cgroup_slow_memory_latency_ns(struct mem_cgroup *memcg);
+extern int mem_cgroup_cold_page_threshold(struct mem_cgroup *memcg);
+extern int mem_cgroup_hot_page_threshold(struct mem_cgroup *memcg);
+extern void mem_cgroup_inc_num_badgerTrap_faults(struct mem_cgroup *memcg,
+        bool is_cold);
+#endif /* CONFIG_POISON_PAGE */
 
 #define mem_cgroup_from_counter(counter, member)	\
 	container_of(counter, struct mem_cgroup, member)
@@ -541,6 +609,40 @@ out:
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 void mem_cgroup_split_huge_fixup(struct page *head);
 #endif
+
+#ifndef CONFIG_POISON_PAGE
+static inline unsigned int mem_cgroup_poison_page(struct mem_cgroup *memcg)
+{
+    return 0;
+}
+
+static inline void mem_cgroup_increment_fault_time(
+        struct mem_cgroup *memcg, unsigned long long fault_time)
+{
+
+}
+
+static inline unsigned int mem_cgroup_slow_memory_latency_ns(struct mem_cgroup *memcg)
+{
+    return 0;
+}
+
+static inline int mem_cgroup_cold_page_threshold(struct mem_cgroup *memcg)
+{
+    return 0;
+}
+
+static inline int mem_cgroup_hot_page_threshold(struct mem_cgroup *memcg)
+{
+    return 0;
+}
+
+static inline void mem_cgroup_inc_num_badgerTrap_faults(struct mem_cgroup *memcg
+        bool is_cold)
+{
+    return;
+}
+#endif /* !CONFIG_POISON_PAGE */
 
 #else /* CONFIG_MEMCG */
 

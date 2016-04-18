@@ -78,7 +78,8 @@
 #define IF_HAVE_PG_TEAM(flag,string)
 #endif
 
-#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT) \
+|| defined(CONFIG_KSTALED)
 #define IF_HAVE_PG_IDLE(flag,string) ,{1UL << flag, string}
 #else
 #define IF_HAVE_PG_IDLE(flag,string)
@@ -110,7 +111,8 @@ IF_HAVE_PG_UNCACHED(PG_uncached,	"uncached"	)		\
 IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
 IF_HAVE_PG_TEAM(PG_team,		"team"		)		\
 IF_HAVE_PG_IDLE(PG_young,		"young"		)		\
-IF_HAVE_PG_IDLE(PG_idle,		"idle"		)
+IF_HAVE_PG_IDLE(PG_idle,		"idle"		)		\
+IF_HAVE_PG_IDLE(PG_stale,		"stale"		)
 
 #define show_page_flags(flags)						\
 	(flags) ? __print_flags(flags, "|",				\

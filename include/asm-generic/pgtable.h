@@ -10,6 +10,9 @@
 #include <linux/bug.h>
 #include <linux/errno.h>
 
+extern inline int is_pmd_reserved(pmd_t pmd);
+extern inline pmd_t pmd_unreserve(pmd_t pmd);
+
 #if 4 - defined(__PAGETABLE_PUD_FOLDED) - defined(__PAGETABLE_PMD_FOLDED) != \
 	CONFIG_PGTABLE_LEVELS
 #error CONFIG_PGTABLE_LEVELS is not consistent with __PAGETABLE_{PUD,PMD}_FOLDED
@@ -388,6 +391,12 @@ static inline int pmd_none_or_clear_bad(pmd_t *pmd)
 {
 	if (pmd_none(*pmd))
 		return 1;
+#ifdef CONFIG_POISON_PAGE
+    if (is_pmd_reserved(*pmd)) {
+        trace_printk("PMD is reserved: %lx\n", pmd_val(*pmd));
+        return 1;
+    }
+#endif
 	if (unlikely(pmd_bad(*pmd))) {
 		pmd_clear_bad(pmd);
 		return 1;
@@ -706,8 +715,16 @@ static inline int pmd_none_or_trans_huge_or_clear_bad(pmd_t *pmd)
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	barrier();
 #endif
-	if (pmd_none(pmdval) || pmd_trans_huge(pmdval))
+	if (pmd_none(pmdval) || pmd_trans_huge(pmdval) || is_pmd_reserved(pmdval)) {
+        if (is_pmd_reserved(pmdval)) {
+            trace_printk("PMD is reserved: %lx\n", pmd_val(*pmd));
+            /* TODO We should not un reserve PMD here. Need to figure out why is
+             * code looping through here.
+             */
+            *pmd = pmd_unreserve(*pmd);
+        }
 		return 1;
+    }
 	if (unlikely(pmd_bad(pmdval))) {
 		pmd_clear_bad(pmd);
 		return 1;
@@ -731,6 +748,8 @@ static inline int pmd_none_or_trans_huge_or_clear_bad(pmd_t *pmd)
 static inline int pmd_trans_unstable(pmd_t *pmd)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+    WARN_ON(!(pmd_none(*pmd) || pmd_trans_huge(*pmd) || is_pmd_reserved(*pmd))
+            && pmd_bad(*pmd));
 	return pmd_none_or_trans_huge_or_clear_bad(pmd);
 #else
 	return 0;

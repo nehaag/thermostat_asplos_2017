@@ -422,11 +422,26 @@ static void bad_page(struct page *page, const char *reason,
 	static unsigned long nr_shown;
 	static unsigned long nr_unshown;
 
-	/* Don't complain about poisoned pages */
-	if (PageHWPoison(page)) {
-		page_mapcount_reset(page); /* remove PageBuddy */
-		return;
-	}
+#ifdef CONFIG_POISON_PAGE
+    struct mem_cgroup *memcg;
+
+    if (!page->mem_cgroup)
+        goto resume_normal_path;
+    memcg = page->mem_cgroup;
+
+    /* Don't complain about poisoned pages or if pages are poiosned to simulate
+     * slow memory
+     */
+    if (PageHWPoison(page) || mem_cgroup_poison_page(memcg)) {
+#else
+        /* Don't complain about poisoned pages */
+        if (PageHWPoison(page)) {
+#endif
+            page_mapcount_reset(page); /* remove PageBuddy */
+            return;
+        }
+
+resume_normal_path:
 
 	/*
 	 * Allow a burst of 60 reports, then keep quiet for that minute;
@@ -788,6 +803,11 @@ static inline int free_pages_check(struct page *page)
 		return 1;
 	}
 	page_cpupid_reset_last(page);
+
+#ifdef CONFIG_POISON_PAGE
+    page_poison_reset(page);
+#endif
+
 	if (page->flags & PAGE_FLAGS_CHECK_AT_PREP)
 		page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	return 0;
@@ -936,6 +956,10 @@ static void __meminit __init_single_page(struct page *page, unsigned long pfn,
 	init_page_count(page);
 	page_mapcount_reset(page);
 	page_cpupid_reset_last(page);
+
+#ifdef CONFIG_POISON_PAGE
+    page_poison_reset(page);
+#endif
 
 	INIT_LIST_HEAD(&page->lru);
 #ifdef WANT_PAGE_VIRTUAL

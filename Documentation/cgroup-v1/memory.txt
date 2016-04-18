@@ -840,7 +840,107 @@ Test:
    (Expect a bunch of notifications, and eventually, the oom-killer will
    trigger.)
 
-12. TODO
+12. Idle page tracking
+
+Idle page tracking works by scanning physical memory at a known rate,
+finding idle pages, and accounting for them in the cgroup owning them.
+
+Idle pages are defined as user pages (either anon or file backed) that have
+not been accessed for a number of consecutive scans, and are also not
+currently pinned down (for example by being mlocked).
+
+12.1 Usage
+
+The first step is to select the global scanning rate:
+
+# echo 120 > /sys/kernel/mm/kstaled/scan_seconds	# 2 minutes per scan
+
+(At boot time, the default value for /sys/kernel/mm/kstaled/scan_seconds
+is 0 which means the idle page tracking feature is disabled).
+
+Then, the per-cgroup memory.idle_page_stats files get updated at the
+end of every scan. The relevant fields are:
+* idle_clean: idle pages that have been untouched for at least one scan cycle,
+  and are also clean. Being clean and unpinned, such pages are immediately
+  reclaimable by the MM's LRU algorithms.
+* idle_dirty_file: idle pages that have been untouched for at least one
+  scan cycle, are dirty, and are file backed. Such pages are not immediately
+  reclaimable as writeback needs to occur first.
+* idle_dirty_swap: idle pages that have been untouched for at least one
+  scan cycle, are dirty, and would have to be written to swap before being
+  reclaimed. This includes dirty anon memory, tmpfs files and shm segments.
+  Note that such pages are counted as idle_dirty_swap regardless of whether
+  swap is enabled or not on the system.
+* idle_2_clean, idle_2_dirty_file, idle_2_dirty_swap: same definitions as
+  above, but for pages that have been untouched for at least two scan cycles.
+* these fields repeat up to idle_240_clean, idle_240_dirty_file and
+  idle_240_dirty_swap, allowing one to observe idle pages over a variety
+  of idle interval lengths. Note that the accounting is cumulative:
+  pages counted as idle for a given interval length are also counted
+  as idle for smaller interval lengths.
+* scans: number of physical memory scans since the cgroup was created.
+
+All the above fields are updated exactly once per scan.
+
+12.2 Responsiveness guarantees
+
+After a user page stops being touched and/or pinned, it takes at least one
+scan cycle for that page to be considered as idle and accounted as such
+in one of the idle_clean / idle_dirty_file / idle_dirty_swap counts
+(or, n scan cycles for the page to be accounted as idle in one of the
+idle_N_clean / idle_N_dirty_file / idle_N_dirty_swap counts).
+
+However, there is no guarantee that pages will be detected that fast.
+In the worst case, it could take up to two extra scan cycle intervals
+for a page to be accounted as idle. This is because after userspace stops
+touching the page, it may take up to one scan interval before we next
+scan it (at which point the page will be seen as not idle yet since it
+was touched during the previous scan) and after the page is finally scanned
+again and detected as idle, it may take up to one extra scan interval before
+completing the physical memory scan and exporting the updated statistics.
+
+Conversely, when userspace touches or pins a page that was previously
+accounted for as idle, it may take up to two scan intervals before the
+corresponding statistics are updated. Once again, this is because it may
+take up to one scan interval before scanning the page and finding it not
+idle anymore, and up to one extra scan interval before completing the
+physical memory scan and exporting the updated statistics.
+
+12.3 Incremental idle page tracking
+
+In some situations, it is desired to obtain faster feedback when
+previously idle, clean user pages start being touched. Remember that
+unpinned clean pages are immediately reclaimable by the MM's LRU
+algorithms. A high number of such pages being idle in a given cgroup
+indicates that this cgroup is not experiencing high memory pressure.
+A decrease of that number can be seen as a leading indicator that
+memory pressure is about to increase, and it may be desired to act
+upon that indication before the two scan interval measurement delay.
+
+The incremental idle page tracking feature can be used for that case.
+It allows for tracking of idle clean pages only, and only for a
+predetermined number of scan intervals (no histogram functionality as
+in the main interface).
+
+The desired idle period must first be selected on a per-cgroup basis
+by writing an integer to the memory.stale_page_age file. The integer
+is the interval we want pages to be idle for, expressed in scan cycles.
+For example to check for pages that have been idle for 5 consecutive
+scan cycles (equivalent to the idle_5_clean statistic), one would
+write 5 to the memory.stale_page_age file. The default value for the
+memory.stale_page_age file is 0, which disables the incremental idle
+page tracking feature.
+
+During scanning, clean unpinned pages that have not been touched for the
+chosen number of scan cycles are incrementally accounted for and reflected
+in the "stale" statistic in memory.idle_page_stats. Likewise, pages that
+were previously accounted as stale and are found not to be idle anymore
+are also incrementally accounted for. Additionally, any pages that are
+being considered by the LRU replacement algorithm and found to have been
+touched are also incrementally accounted for.
+
+
+13. TODO
 
 1. Make per-cgroup scanner reclaim not-shared pages first
 2. Teach controller to account for shared-pages

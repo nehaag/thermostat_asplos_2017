@@ -98,6 +98,18 @@ enum ttu_flags {
 					 * caller holds it */
 };
 
+/*
+ * Information to be filled by page_referenced() and friends.
+ */
+struct page_referenced_info {
+    unsigned long vm_flags;
+    unsigned int pr_flags;
+    int referenced;
+#define PR_REFERENCED  1
+#define PR_DIRTY       2
+#define PR_FOR_KSTALED 4
+};
+
 #ifdef CONFIG_MMU
 static inline void get_anon_vma(struct anon_vma *anon_vma)
 {
@@ -181,8 +193,8 @@ static inline void page_dup_rmap(struct page *page, bool compound)
 /*
  * Called from mm/vmscan.c to handle paging out
  */
-int page_referenced(struct page *, int is_locked,
-			struct mem_cgroup *memcg, unsigned long *vm_flags);
+int __page_referenced(struct page *, int is_locked,
+        struct mem_cgroup *memcg, struct page_referenced_info *info);
 
 #define TTU_ACTION(x) ((x) & TTU_ACTION_MASK)
 
@@ -279,12 +291,10 @@ int rmap_walk_locked(struct page *page, struct rmap_walk_control *rwc);
 #define anon_vma_prepare(vma)	(0)
 #define anon_vma_link(vma)	do {} while (0)
 
-static inline int page_referenced(struct page *page, int is_locked,
+static inline void __page_referenced(struct page *page, int is_locked,
 				  struct mem_cgroup *memcg,
-				  unsigned long *vm_flags)
+                  struct page_referenced_info *info)
 {
-	*vm_flags = 0;
-	return 0;
 }
 
 #define try_to_unmap(page, refs) SWAP_FAIL
@@ -296,6 +306,91 @@ static inline int page_mkclean(struct page *page)
 
 
 #endif	/* CONFIG_MMU */
+
+/**
+ * page_referenced - test if the page was referenced
+ * @page: the page to test
+ * @is_locked: caller holds lock on the page
+ * @mem_cont: target memory controller
+ * @vm_flags: collect encountered vma->vm_flags who actually referenced the page
+ *
+ * Quick test_and_clear_referenced for all mappings to a page,
+ * returns the number of ptes which referenced the page.
+ */
+static inline void page_referenced(struct page *page,
+        int is_locked,
+        struct mem_cgroup *mem_cont,
+        struct page_referenced_info *info)
+{
+    info->vm_flags = 0;
+    info->pr_flags = 0;
+
+#ifdef CONFIG_KSTALED
+    /*
+     * Always clear PageYoung at the start of a scanning interval. It will
+     * get get set if kstaled clears a young bit in a pte reference,
+     * so that vmscan will still see the page as referenced.
+     */
+    if (PageYoung(page)) {
+        ClearPageYoung(page);
+        info->pr_flags |= PR_REFERENCED;
+    }
+#endif
+
+    __page_referenced(page, is_locked, mem_cont, info);
+}
+
+#ifdef CONFIG_KSTALED
+static inline void page_referenced_kstaled(struct page *page, bool is_locked,
+        struct page_referenced_info *info)
+{
+    info->vm_flags = 0;
+    info->pr_flags = PR_FOR_KSTALED;
+    info->referenced = 0;
+
+    /*
+     * Always set PageIdle at the start of a scanning interval. It will
+     * get cleared if a young page reference is encountered; otherwise
+     * the page will be counted as idle at the next kstaled scan cycle.
+     */
+    if (!PageIdle(page)) {
+        SetPageIdle(page);
+        info->pr_flags |= PR_REFERENCED;
+    }
+
+    __page_referenced(page, is_locked, NULL, info);
+}
+#endif
+
+#ifdef CONFIG_POISON_PAGE
+/**
+ * page_poison - poison page PTE
+ * @page: the page to poison
+ * @is_locked: caller holds lock on the page
+ * @memcg: target memory cgroup
+ * @poison: whether to poison or un-poison
+ *
+ * Quick poison PTE for all mappings to a page,
+ */
+void page_poison(struct page *page, int is_locked, struct mem_cgroup *memcg,
+        bool poison);
+
+/**
+ * page_collapse_to_huge - collapse regular pages to huge page
+ * @page: the page to poison
+ * @is_locked: caller holds lock on the page
+ */
+void page_collapse_to_huge(struct page *page, int is_locked, bool poison);
+
+/**
+ * page_split_for_sampling - split huge page and update PTEs of all processes
+ * @page: the page to split 
+ * @is_locked: caller holds lock on the page
+ *
+ * Quick split pmds for all mappings to a page,
+ */
+int page_split_for_sampling(struct page *page, int is_locked);
+#endif /* CONFIG_POISON_PAGE */
 
 /*
  * Return values of try_to_unmap

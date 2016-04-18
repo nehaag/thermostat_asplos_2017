@@ -148,6 +148,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 	struct vm_area_struct *vma = walk->private;
 	unsigned long index;
 
+    WARN_ON(!(pmd_none(*pmd) || pmd_trans_huge(*pmd)) && pmd_bad(*pmd));
 	if (pmd_none_or_trans_huge_or_clear_bad(pmd))
 		return 0;
 

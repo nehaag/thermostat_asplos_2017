@@ -664,6 +664,12 @@ typedef struct pglist_data {
 	unsigned long node_present_pages; /* total number of physical pages */
 	unsigned long node_spanned_pages; /* total size of physical page
 					     range, including holes */
+#ifdef CONFIG_KSTALED
+    unsigned long node_idle_scan_pfn;
+    u8 *node_idle_page_age;           /* number of scan intervals since
+                                         each page was referenced */
+#endif
+ 	int node_id;
 	int node_id;
 	wait_queue_head_t kswapd_wait;
 	wait_queue_head_t pfmemalloc_wait;
@@ -1007,6 +1013,12 @@ static inline unsigned long early_pfn_to_nid(unsigned long pfn)
 
 #ifdef CONFIG_FLATMEM
 #define pfn_to_nid(pfn)		(0)
+#endif
+
+#ifndef ARCH_HAVE_PFN_SKIP_HOLE
+static inline void pfn_skip_hole(unsigned long *start, unsigned long *end)
+{
+}
 #endif
 
 #ifdef CONFIG_SPARSEMEM

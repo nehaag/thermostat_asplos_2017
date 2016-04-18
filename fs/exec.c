@@ -67,6 +67,9 @@
 
 #include <trace/events/sched.h>
 
+extern int is_badger_trap_process(const char* proc_name);
+extern void badger_trap_init(struct mm_struct *mm);
+
 int suid_dumpable = 0;
 
 static LIST_HEAD(formats);

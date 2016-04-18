@@ -83,9 +83,11 @@ static inline bool page_is_young(struct page *page)
 	return false;
 }
 
+#ifndef CONFIG_KSTALED
 static inline void set_page_young(struct page *page)
 {
 }
+#endif
 
 static inline bool test_and_clear_page_young(struct page *page)
 {
@@ -101,9 +103,11 @@ static inline void set_page_idle(struct page *page)
 {
 }
 
+#ifdef CONFIG_KSTALED
 static inline void clear_page_idle(struct page *page)
 {
 }
+#endif
 
 #endif /* CONFIG_IDLE_PAGE_TRACKING */
 

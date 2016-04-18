@@ -89,7 +89,7 @@ static inline struct page *ksm_might_need_to_copy(struct page *page,
 }
 
 static inline int page_referenced_ksm(struct page *page,
-			struct mem_cgroup *memcg, unsigned long *vm_flags)
+		struct mem_cgroup *memcg, struct page_referenced_info *info)
 {
 	return 0;
 }

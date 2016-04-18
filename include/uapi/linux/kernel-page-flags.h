@@ -36,5 +36,6 @@
 #define KPF_IDLE		25
 #define KPF_TEAM		26
 #define KPF_TEAM_PMD_MMAP	27
+#define KPF_STALE		28
 
 #endif /* _UAPILINUX_KERNEL_PAGE_FLAGS_H */

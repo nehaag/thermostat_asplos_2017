@@ -70,6 +70,14 @@ extern unsigned long init_memory_mapping(unsigned long start,
 
 extern void initmem_init(void);
 
+extern void e820_skip_hole(unsigned long *start_pfn, unsigned long *end_pfn);
+
+#define ARCH_HAVE_PFN_SKIP_HOLE 1
+static inline void pfn_skip_hole(unsigned long *start, unsigned long *end)
+{
+    e820_skip_hole(start, end);
+}
+
 #endif	/* !__ASSEMBLY__ */
 
 #endif	/* _ASM_X86_PAGE_DEFS_H */

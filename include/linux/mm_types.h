@@ -216,6 +216,17 @@ struct page {
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
+
+#ifdef CONFIG_POISON_PAGE
+    unsigned int in_sampling_state;
+    bool is_page_cold;
+    atomic_t num_accesses;
+    bool is_page_split;
+#ifdef CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE
+    bool is_page_selected_for_locality_analysis;
+    bool is_first_kstaled_scan_done;
+#endif /* CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE */
+#endif /* CONFIG_POISON_PAGE */
 }
 /*
  * The struct page can be forced to be double word aligned so that atomic ops

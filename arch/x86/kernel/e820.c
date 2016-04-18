@@ -1191,3 +1191,48 @@ void __init memblock_find_dma_reserve(void)
 	set_dma_reserve(nr_pages - nr_free_pages);
 #endif
 }
+
+/*
+ * The caller wants to skip pfns that are guaranteed to not be valid
+ * memory. Find a stretch of ram between [start_pfn, end_pfn) and
+ * return its pfn range back through start_pfn and end_pfn.
+ */
+
+void e820_skip_hole(unsigned long *start_pfn, unsigned long *end_pfn)
+{
+    unsigned long start = *start_pfn << PAGE_SHIFT;
+    unsigned long end = *end_pfn << PAGE_SHIFT;
+    int i;
+
+    if (start >= end)
+        goto fail;		/* short-circuit e820 checks */
+
+    for (i = 0; i < e820.nr_map; i++) {
+        struct e820entry *ei = &e820.map[i];
+        unsigned long last, addr;
+
+        addr = round_up(ei->addr, PAGE_SIZE);
+        last = round_down(ei->addr + ei->size, PAGE_SIZE);
+
+        if (addr >= end)
+            goto fail;	/* We're done, not found */
+        if (last <= start)
+            continue;	/* Not at start yet, move on */
+        if (ei->type != E820_RAM)
+            continue;	/* Not RAM, move on */
+
+        /*
+         * We've found RAM. If start is in this e820 range, return
+         * it, otherwise return the start of this e820 range.
+         */
+
+        if (addr > start)
+            *start_pfn = addr >> PAGE_SHIFT;
+        if (last < end)
+            *end_pfn = last >> PAGE_SHIFT;
+        return;
+    }
+fail:
+    *start_pfn = *end_pfn;
+    return;				/* No luck, return failure */
+}

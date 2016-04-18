@@ -62,8 +62,10 @@
 #include <linux/hugetlb.h>
 #include <linux/backing-dev.h>
 #include <linux/page_idle.h>
+#include <linux/badger_trap.h>
 
 #include <asm/tlbflush.h>
+#include <asm/pgalloc.h>
 
 #include <trace/events/tlb.h>
 
@@ -893,10 +895,69 @@ struct page_referenced_arg {
 	int mapcount;
 	int referenced;
 	unsigned long vm_flags;
+    unsigned int pr_flags;
 	struct mem_cgroup *memcg;
 };
+
+static int __check_pte_and_set_pra(struct page *page,
+        struct vm_area_struct *vma,
+        unsigned long address,
+        pte_t *pte,
+        struct page_referenced_arg* pra)
+{
+    int referenced = 0;
+    if (pte_dirty(*pte))
+        pra->pr_flags |= PR_DIRTY;
+
+    if (!(pra->pr_flags & PR_FOR_KSTALED)) {
+        if (ptep_clear_flush_young_notify(vma, address, pte)) {
+            /*
+             * Don't treat a reference through a sequentially read
+             * mapping as such.  If the page has been used in
+             * another mapping, we will catch it; if this other
+             * mapping is already gone, the unmap path will have
+             * set PG_referenced or activated the page.
+             */
+            if (likely(!(vma->vm_flags & VM_SEQ_READ)))
+                referenced = 1;
+            clear_page_idle(page);
+        }
+    } else {
+        /*
+         * Within page_referenced_kstaled():
+         * skip TLB shootdown & VM_SEQ_READ heuristic
+         */
+        if (ptep_test_and_clear_young(vma, address, pte)) {
+            referenced = 1;
+            set_page_young(page);
+        }
+    }
+    pte_unmap(pte);
+
+    return referenced;
+}
+
+static void __update_pra_with_referenced (struct page_referenced_arg* pra,
+        struct vm_area_struct* vma,
+        int referenced)
+{
+    if (referenced) {
+        pra->referenced += referenced;
+        pra->vm_flags |= vma->vm_flags;
+        pra->pr_flags |= PR_REFERENCED;
+    }
+}
+
 /*
  * arg: page_referenced_arg will be passed
+ * If PR_FOR_KSTALED is set in pra, updates pra->referenced with the number of
+ * 4KB pages that have been referenced in this page. If this is a 4KB page, this
+ * will be at most 1. If this is a 2MB page, it will be at most 512. Otherwise
+ * pra->referenced is either 0 or 1 according to if the page is referenced or
+ * not.
+ * Also, if PR_FOR_KSTALED is set, updates page->num_accesses in each of the
+ * 4KB pages (if split huge page or regular page) or 2MB pages (if real huge
+ * page) with whether this page was referenced in this period.
  */
 static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 			unsigned long address, void *arg)
@@ -911,6 +972,8 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl))
 		return SWAP_AGAIN;
 
+    pra->pr_flags |= PR_DIRTY;
+
 	if (vma->vm_flags & VM_LOCKED) {
 		if (pte)
 			pte_unmap(pte);
@@ -919,28 +982,55 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 		return SWAP_FAIL; /* To break the loop */
 	}
 
+    /* In this case the page is a small page or a split huge page */
 	if (pte) {
-		if (ptep_clear_flush_young_notify(vma, address, pte)) {
-			/*
-			 * Don't treat a reference through a sequentially read
-			 * mapping as such.  If the page has been used in
-			 * another mapping, we will catch it; if this other
-			 * mapping is already gone, the unmap path will have
-			 * set PG_referenced or activated the page.
-			 */
-			if (likely(!(vma->vm_flags & VM_SEQ_READ)))
-				referenced++;
+        if (PageTransHuge(page) && (pra->pr_flags & PR_FOR_KSTALED)) {
+            /* 
+             * In this case it is a split huge page. All the PTEs are stored
+             * consecutively in the same memory region, so we can simply check
+             * them one by one.
+             */
+            int offset;
+            for (offset = 0; offset < 512; offset++) {
+                referenced = __check_pte_and_set_pra(page,
+                        vma,
+                        address,
+                        pte + offset,
+                        pra);
+#ifdef CONFIG_POISON_PAGE
+                atomic_inc(&page[offset].num_accesses);
+#endif
+                __update_pra_with_referenced(pra, vma, referenced);
+            }
+        } else {
+            referenced = __check_pte_and_set_pra(page, vma, address, pte, pra);
+            __update_pra_with_referenced(pra, vma, referenced);
+        }
+    } else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+		if (!(pra->pr_flags & PR_FOR_KSTALED)) {
+			if (pmdp_clear_flush_young_notify(vma, address, pmd)) {
+				referenced = 1;
+				clear_page_idle(page);
+			}
+            __update_pra_with_referenced(pra, vma, referenced);
+		} else {
+			if (pmdp_test_and_clear_young(vma, address, pmd)) {
+				referenced = 512;
+				set_page_young(page);
+                /* Do not increment num_accesses here since in this case page is
+                 * not being sampled.
+                 */
+			}
+            __update_pra_with_referenced(pra, vma, referenced);
 		}
-		pte_unmap(pte);
-	} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
-		if (pmdp_clear_flush_young_notify(vma, address, pmd))
-			referenced++;
 	} else {
 		/* unexpected pmd-mapped page? */
 		WARN_ON_ONCE(1);
 	}
 	spin_unlock(ptl);
 
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+    /* BUG: Check if pra and referenced are updated here correctly. */
 	if (referenced)
 		clear_page_idle(page);
 	if (test_and_clear_page_young(page))
@@ -950,6 +1040,7 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 		pra->referenced++;
 		pra->vm_flags |= vma->vm_flags;
 	}
+#endif
 
 	pra->mapcount--;
 	if (!pra->mapcount)
@@ -970,25 +1061,28 @@ static bool invalid_page_referenced_vma(struct vm_area_struct *vma, void *arg)
 }
 
 /**
- * page_referenced - test if the page was referenced
+ * __page_referenced - test if the page was referenced
  * @page: the page to test
  * @is_locked: caller holds lock on the page
  * @memcg: target memory cgroup
- * @vm_flags: collect encountered vma->vm_flags who actually referenced the page
+ * @info: collect encountered vma->vm_flags who actually referenced the page
+ *        as well as flags describing the page references encountered.
  *
  * Quick test_and_clear_referenced for all mappings to a page,
  * returns the number of ptes which referenced the page.
  */
-int page_referenced(struct page *page,
+int __page_referenced(struct page *page,
 		    int is_locked,
 		    struct mem_cgroup *memcg,
-		    unsigned long *vm_flags)
+            struct page_referenced_info *info)
 {
 	int ret;
 	int we_locked = 0;
 	struct page_referenced_arg pra = {
 		.mapcount = total_mapcount(page),
 		.memcg = memcg,
+        .pr_flags = info->pr_flags,
+        .referenced = 0,
 	};
 	struct rmap_walk_control rwc = {
 		.rmap_one = page_referenced_one,
@@ -996,7 +1090,6 @@ int page_referenced(struct page *page,
 		.anon_lock = page_lock_anon_vma_read,
 	};
 
-	*vm_flags = 0;
 	if (!page_mapped(page))
 		return 0;
 
@@ -1005,8 +1098,10 @@ int page_referenced(struct page *page,
 
 	if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
 		we_locked = trylock_page(page);
-		if (!we_locked)
+		if (!we_locked) {
+            info->pr_flags |= PR_REFERENCED;
 			return 1;
+        }
 	}
 
 	/*
@@ -1019,13 +1114,375 @@ int page_referenced(struct page *page,
 	}
 
 	ret = rmap_walk(page, &rwc);
-	*vm_flags = pra.vm_flags;
+    info->vm_flags = pra.vm_flags;
+    info->pr_flags = pra.pr_flags;
+    info->referenced = pra.referenced;
 
 	if (we_locked)
 		unlock_page(page);
 
 	return pra.referenced;
 }
+
+#ifdef CONFIG_POISON_PAGE
+static int page_poison_one(struct page *page, struct vm_area_struct *vma,
+        unsigned long address, void *arg)
+{
+    struct mm_struct *mm = vma->vm_mm;
+	pmd_t *pmd;
+	pte_t *pte;
+	spinlock_t *ptl;
+    bool *poison = arg;
+
+	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl))
+		return SWAP_AGAIN;
+
+	if (vma->vm_flags & VM_LOCKED) {
+		if (pte)
+			pte_unmap(pte);
+		spin_unlock(ptl);
+		return SWAP_FAIL; /* To break the loop */
+	}
+
+    if (pte) {
+        if (*poison) {
+            /* Poison PTE */
+            *pte = pte_mkreserve(*pte);
+        } else {
+            /* Un-Poison PTE */
+            *pte = pte_unreserve(*pte);
+        }
+        pte_unmap(pte);
+    } else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+        if (pmd) {
+            if (*poison) {
+                /* Poison PMD */
+                *pmd = pmd_mkreserve(*pmd);
+            } else {
+                /* Un-Poison PMD */
+                *pmd = pmd_unreserve(*pmd);
+            }
+        }
+    }
+
+    spin_unlock(ptl);
+    return SWAP_AGAIN;
+}
+
+/**
+ * page_poison - poison page PTE 
+ * @page: the page to poison
+ * @is_locked: caller holds lock on the page
+ * @memcg: target memory cgroup
+ * @poison: whether to poison or un-poison
+ *
+ * Quick poison PTE for all mappings to a page,
+ */
+void page_poison(struct page *page, int is_locked, struct mem_cgroup *memcg,
+        bool poison)
+{
+    int we_locked = 0;
+    struct rmap_walk_control rwc = {
+        .arg = (void *)&poison,
+        .rmap_one = page_poison_one,
+        .anon_lock = page_lock_anon_vma_read,
+    };
+
+    if (!page_mapped(page))
+        return;
+
+    if (!page_rmapping(page))
+        return;
+
+    if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
+        we_locked = trylock_page(page);
+        if (!we_locked) {
+            return;
+        }
+    }
+
+    if (PageKsm(page))
+        return;
+
+    rmap_walk(page, &rwc);
+
+    if (we_locked)
+        unlock_page(page);
+
+    return;
+}
+
+static int collapse_ptes(struct mm_struct *mm,
+        unsigned long address,
+        struct vm_area_struct *vma,
+        struct page *page,
+        bool poison)
+{
+    pmd_t *pmd, _pmd;
+    pte_t *pte, *_pte;
+    spinlock_t *pte_ptl;
+	spinlock_t *pmd_ptl;
+	pgtable_t pgtable;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
+
+    VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+
+	down_write(&mm->mmap_sem);
+	anon_vma_lock_write(vma->anon_vma);
+
+    /* Get the PMD, first PTE and lock pte_ptl = pte_lockptr(mm, pmd). */
+	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &pte_ptl)) {
+        anon_vma_unlock_write(vma->anon_vma);
+        up_write(&mm->mmap_sem);
+        return 1;
+    }
+    BUG_ON(!pmd);
+    if (pmd_trans_huge(*pmd))
+        printk("Collapsing huge PMD : %lx\n", pmd_val(*pmd));
+    BUG_ON(pmd_trans_huge(*pmd));
+
+    /* Do pmdp_collapse_flush and mmu_notifier. */
+    /*
+     * Flush TLB
+     */
+	mmun_start = address;
+	mmun_end   = address + HPAGE_PMD_SIZE;
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+	pmd_ptl = pmd_lock(mm, pmd); /* probably unnecessary */
+//    flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+	_pmd = pmdp_collapse_flush(vma, address, pmd);
+	spin_unlock(pmd_ptl);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+
+    /* Clear PTEs */
+	for (_pte = pte; _pte < pte+HPAGE_PMD_NR; _pte++) {
+        pte_clear(vma->vm_mm, address, _pte);
+    }
+
+    /*
+     * Release the PTE lock.
+     */
+    spin_unlock(pte_ptl);
+
+	pgtable = pmd_pgtable(_pmd);
+
+    /* Set the PMD to be huge. */
+    _pmd = mk_pmd(page, vma->vm_page_prot);
+    _pmd = pmd_mkhuge(_pmd);
+    _pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
+
+    /* Poison PMD. */
+    if (poison)
+        _pmd = pmd_mkreserve(_pmd);
+
+    if (pmd_val(_pmd) == 0)
+        BUG_ON(1);
+
+    /*
+     * Deposit the page containing PTEs. Set the new PMD.
+     */
+	pmd_ptl = pmd_lock(mm, pmd);
+	BUG_ON(!pmd_none(*pmd));
+	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+    set_pmd_at(mm, address, pmd, _pmd);
+    spin_unlock(pmd_ptl);
+
+    /* Reset is_page_split flag. */
+    page->is_page_split = 0;
+
+    /* Release the locks. */
+    anon_vma_unlock_write(vma->anon_vma);
+    up_write(&mm->mmap_sem);
+
+    return 0;
+}
+
+static int page_collapse_one(struct page *page, struct vm_area_struct *vma,
+        unsigned long address, void *arg)
+{
+    struct mm_struct *mm = vma->vm_mm;
+    bool *poison = arg;
+
+    if (!PageAnon(page))
+        return SWAP_FAIL;
+
+    collapse_ptes(mm, address, vma, page, poison);
+
+    return SWAP_AGAIN;
+}
+
+static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
+		bool locked);
+/**
+ * page_collapse_to_huge - collapse regular pages to huge page
+ * @page: the page to poison
+ * @is_locked: caller holds lock on the page
+ *
+ */
+void page_collapse_to_huge(struct page *page, int is_locked, bool poison)
+{
+    int we_locked = 0;
+
+    /* Here we do not take any locks. Instead unlike other places we will lock
+     * the mm and anon_vma inside page_collapse_one function, as we need to lock
+     * the write semaphore instead of read.*/
+    struct rmap_walk_control rwc = {
+        .rmap_one = page_collapse_one,
+        .arg = (void *)&poison,
+    };
+
+    if (!page_mapped(page))
+        return;
+
+    if (!page_rmapping(page))
+        return;
+
+    if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
+        we_locked = trylock_page(page);
+        if (!we_locked) {
+            return;
+        }
+    }
+
+    if (PageKsm(page))
+        return;
+
+    /* TODO For now only collapse the anonymous pages. Add support for file and
+     * KSM pages.
+     */
+//    rmap_walk(page, &rwc);
+    rmap_walk_anon(page, &rwc, true);
+
+    if (we_locked)
+        unlock_page(page);
+
+    return;
+}
+
+static int page_split_one(struct page *page, struct vm_area_struct *vma,
+        unsigned long address, void *arg)
+{
+    struct mm_struct *mm = vma->vm_mm;
+	pmd_t *pmd;
+	pte_t *pte;
+	spinlock_t *ptl;
+    int *split_successful = (int*)arg;
+
+	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl)) {
+        *split_successful &= 0;
+		return SWAP_AGAIN;
+    }
+
+	if (vma->vm_flags & VM_LOCKED) {
+		if (pte)
+			pte_unmap(pte);
+		spin_unlock(ptl);
+        *split_successful &= 0;
+		return SWAP_FAIL; /* To break the loop */
+	}
+
+    if (!pmd_present(*pmd) || (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd))) {
+        spin_unlock(ptl);
+        *split_successful &= 0;
+        return SWAP_FAIL;
+    }
+
+    /*
+     * Here we un-reserve PMD before splitting to svoid the race condition
+     * between a page being split and handling badgertrap fault to the same
+     * page. We will poison PTEs later. With this fix we have made this page
+     * temprarily hot, hoping there will not be many pages like that.
+     * TODO Remove the race between splitting and badertrap fake fault handling
+     * functions.
+     */
+    bool pmd_was_reserved = false;
+    if (is_pmd_reserved(*pmd)) {
+        *pmd = pmd_unreserve(*pmd);
+        pmd_was_reserved = true;
+    }
+
+    spin_unlock(ptl);
+
+    split_huge_pmd(vma, pmd, address);
+    if(!pmd_trans_huge(*pmd)) {
+        *split_successful &= 1;
+        page->is_page_split = true;
+
+        /*
+         * If PMD was originally reserved that means this page is cold. Hence,
+         * poison the PTEs after the page is split.
+         */
+        if (pmd_was_reserved && page_check_address_transhuge(page, mm, address,
+                    &pmd, &pte, &ptl)) {
+            int i;
+            for (i = 0; i < HPAGE_PMD_NR; i++) {
+                pte_t *pte_num = pte + i;
+                *pte_num = pte_mkreserve(*pte_num);
+            }
+            spin_unlock(ptl);
+        }
+    } else {
+        /* If PMD was originally reserved and split was not successful then
+         * reserve the PMD again.
+         */
+        if (pmd_was_reserved && page_check_address_transhuge(page, mm, address,
+                    &pmd, &pte, &ptl)) {
+            *pmd = pmd_unreserve(*pmd);
+            spin_unlock(ptl);
+        }
+    }
+
+    return SWAP_AGAIN;
+}
+
+/**
+ * page_split_for_sampling - split huge page and update PTEs of all processes
+ * @page: the page to split 
+ * @is_locked: caller holds lock on the page
+ *
+ * Quick split pmds for all mappings to a page,
+ */
+int page_split_for_sampling(struct page *page, int is_locked)
+{
+    int we_locked = 0;
+    int ret = 1;
+    int all_split_successful = 1;
+    struct rmap_walk_control rwc = {
+        .rmap_one = page_split_one,
+        .anon_lock = page_lock_anon_vma_read,
+        .arg = &all_split_successful
+    };
+
+    if (!page_mapped(page)) {
+        return SWAP_FAIL;
+    }
+
+    if (!page_rmapping(page)) {
+        return 1;
+    }
+
+    if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
+        we_locked = trylock_page(page);
+        if (!we_locked) {
+            return 1;
+        }
+    }
+
+    if (PageKsm(page) || !PageTransHuge(page)) {
+        if (we_locked)
+            unlock_page(page);
+        return 1;
+    }
+
+    ret = rmap_walk(page, &rwc);
+
+    if (we_locked)
+        unlock_page(page);
+
+    return all_split_successful;
+}
+#endif /* CONFIG_POISON_PAGE */
 
 static int page_mkclean_one(struct page *page, struct vm_area_struct *vma,
 			    unsigned long address, void *arg)

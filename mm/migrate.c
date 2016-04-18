@@ -562,10 +562,12 @@ void migrate_page_copy(struct page *newpage, struct page *page)
 	if (PageDirty(page))
 		SetPageDirty(newpage);
 
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
 	if (page_is_young(page))
 		set_page_young(newpage);
 	if (page_is_idle(page))
 		set_page_idle(newpage);
+#endif
 
 	/*
 	 * Copy NUMA information to the new page, to prevent over-eager

@@ -52,6 +52,15 @@
  *
  * PG_hwpoison indicates that a page got corrupted in hardware and contains
  * data with incorrect ECC bits that triggered a machine check. Accessing is
+ *
+ * PG_young indicates that kstaled cleared the young bit on some PTEs pointing
+ * to that page. In order to avoid interacting with the LRU algorithm, we want
+ * the next page_referenced() call to still consider the page young.
+ *
+ * PG_idle indicates that the page has not been referenced since the last time
+ * kstaled scanned it.
+ *
+ * PG_stale indicates that the page is currently counted as stale.
  * not safe since it may cause another machine check. Don't touch!
  */
 
@@ -107,6 +116,11 @@ enum pageflags {
 #if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
 	PG_young,
 	PG_idle,
+#endif
+#ifdef CONFIG_KSTALED
+    PG_young,		/* kstaled cleared pte_young */
+    PG_idle,		/* idle since start of kstaled interval */
+    PG_stale,		/* page is counted as stale */
 #endif
 	__NR_PAGEFLAGS,
 
@@ -356,6 +370,42 @@ SETPAGEFLAG(Young, young, PF_ANY)
 TESTCLEARFLAG(Young, young, PF_ANY)
 PAGEFLAG(Idle, idle, PF_ANY)
 #endif
+
+#ifdef CONFIG_KSTALED
+
+PAGEFLAG(Young, young, PF_ANY)
+PAGEFLAG(Idle, idle, PF_ANY)
+PAGEFLAG(Stale, stale, PF_ANY) TESTSCFLAG(Stale, stale, PF_ANY)
+
+void __set_page_nonstale(struct page *page);
+
+static inline void set_page_nonstale(struct page *page)
+{
+    if (PageStale(page))
+        __set_page_nonstale(page);
+}
+
+static inline void set_page_young(struct page *page)
+{
+    set_page_nonstale(page);
+    if (!PageYoung(page))
+        SetPageYoung(page);
+}
+
+static inline void clear_page_idle(struct page *page)
+{
+    set_page_nonstale(page);
+    if (PageIdle(page))
+        ClearPageIdle(page);
+}
+
+#else /* !CONFIG_KSTALED */
+
+static inline void set_page_nonstale(struct page *page) {}
+static inline void set_page_young(struct page *page) {}
+static inline void clear_page_idle(struct page *page) {}
+
+#endif /* CONFIG_KSTALED */
 
 /*
  * On an anonymous page mapped into a user virtual memory area,

@@ -380,8 +380,13 @@ void mark_page_accessed(struct page *page)
 	} else if (!PageReferenced(page)) {
 		SetPageReferenced(page);
 	}
+
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
 	if (page_is_idle(page))
 		clear_page_idle(page);
+#else
+    clear_page_idle(page);
+#endif
 }
 EXPORT_SYMBOL(mark_page_accessed);
 

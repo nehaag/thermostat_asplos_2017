@@ -117,6 +117,7 @@ void mlock_vma_pages(struct page *page, int nr_pages)
 	for (; page < endpage; page++) {
 		if (TestSetPageMlocked(page))
 			continue;
+        set_page_nonstale(page);
 		mod_zone_page_state(zone, NR_MLOCK, nr_pages);
 		count_vm_event(UNEVICTABLE_PGMLOCKED);
 		if (!isolate_lru_page(page))

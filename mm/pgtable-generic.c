@@ -146,10 +146,13 @@ pgtable_t pgtable_trans_huge_withdraw(struct mm_struct *mm, pmd_t *pmdp)
 {
 	pgtable_t pgtable;
 
+    BUG_ON(!pmdp || !mm);
+
 	assert_spin_locked(pmd_lockptr(mm, pmdp));
 
 	/* FIFO */
 	pgtable = pmd_huge_pte(mm, pmdp);
+    BUG_ON(!pgtable);
 	pmd_huge_pte(mm, pmdp) = list_first_entry_or_null(&pgtable->lru,
 							  struct page, lru);
 	if (pmd_huge_pte(mm, pmdp))
