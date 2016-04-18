@@ -998,7 +998,8 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
                         pte + offset,
                         pra);
 #ifdef CONFIG_POISON_PAGE
-                atomic_inc(&page[offset].num_accesses);
+                if (referenced)
+                    atomic_inc(&page[offset].num_accesses);
 #endif
                 __update_pra_with_referenced(pra, vma, referenced);
             }
@@ -1307,7 +1308,7 @@ static int page_collapse_one(struct page *page, struct vm_area_struct *vma,
     if (!PageAnon(page))
         return SWAP_FAIL;
 
-    collapse_ptes(mm, address, vma, page, poison);
+    collapse_ptes(mm, address, vma, page, *poison);
 
     return SWAP_AGAIN;
 }
@@ -1323,13 +1324,14 @@ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
 void page_collapse_to_huge(struct page *page, int is_locked, bool poison)
 {
     int we_locked = 0;
+    bool poison_arg = poison;
 
     /* Here we do not take any locks. Instead unlike other places we will lock
      * the mm and anon_vma inside page_collapse_one function, as we need to lock
      * the write semaphore instead of read.*/
     struct rmap_walk_control rwc = {
         .rmap_one = page_collapse_one,
-        .arg = (void *)&poison,
+        .arg = (void *)&poison_arg,
     };
 
     if (!page_mapped(page))

@@ -7043,7 +7043,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 
     memcpy(memcg->num_access_distribution_printed, 
             memcg->num_access_distribution, 50 * sizeof(unsigned int));
-    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
+//    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
 
     memcpy(memcg->access_corr_printed, 
             memcg->access_corr, 11 * 11 * sizeof(unsigned int));
