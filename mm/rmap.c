@@ -1185,7 +1185,7 @@ void page_poison(struct page *page, int is_locked, struct mem_cgroup *memcg,
     struct rmap_walk_control rwc = {
         .arg = (void *)&poison,
         .rmap_one = page_poison_one,
-        .anon_lock = page_lock_anon_vma_read,
+//        .anon_lock = page_lock_anon_vma_read,
     };
 
     if (!page_mapped(page))

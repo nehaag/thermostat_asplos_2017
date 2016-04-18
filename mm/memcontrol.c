@@ -6818,7 +6818,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * d) it is not a HugeTLBFS page (determined by !PageHuge(page)),
              * e) it is not the zero page.
              */
-            if (random_number < memcg->poison_sampling_ratio
+            if (memcg && random_number < memcg->poison_sampling_ratio
                     && PageAnon(page)
                     && PageTransHuge(page)
                     && !PageHuge(page)
@@ -6848,8 +6848,10 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * those small pages.
              */
             atomic_set(&page->num_accesses, 0);
-            for (offset = 0; offset < 512; offset++) {
-                atomic_set(&page[offset].num_accesses, 0);
+            if (PageTransHuge(page)) {
+                for (offset = 0; offset < 512; offset++) {
+                    atomic_set(&page[offset].num_accesses, 0);
+                }
             }
         }
     }
