@@ -6627,8 +6627,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
             goto out;
         else if (PageSwapCache(page))
             is_file = false;
-        else if (!mapping_cap_writeback_dirty(mapping))
-            goto out;
+//        else if (!mapping_cap_writeback_dirty(mapping))
+//            goto out;
         else
             is_file = true;
     }
