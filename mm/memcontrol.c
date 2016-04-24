@@ -6633,12 +6633,34 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
             is_file = true;
     }
 
+    /* Check if page is hugetmpfs page. Assuming that huge tmpfs pages have
+     * struct pages for small pages as well then we need to run our hot/cold
+     * policy only for team_head page and not for small pages within that huge
+     * page.
+     */
+
+    /* is_page_hugetmpfs will be true if this page is the head of the huge tmpfs
+     * team pages. */
+    bool is_page_hugetmpfs = false;
+    /* is_page_smalltmpfs will be true if this small page is a part of huge
+     * tmpfs page. */
+    bool is_page_smalltmpfs = false;
+
+    if (!PageAnon(page) && PageTeam(page) && page->mapping) {
+        if (page == team_head(page)) {
+            is_page_hugetmpfs = true;
+        } else {
+            is_page_smalltmpfs = true;
+        }
+    }
+
     /* Find out if the page is idle. Also test for pending mlock. */
-    page_referenced_kstaled(page, is_locked, &info);
+    if (!is_page_smalltmpfs)
+        page_referenced_kstaled(page, is_locked, &info);
 
 #ifdef CONFIG_POISON_PAGE
     /* Locate if poison bit is enabled for the page's mem_cgroup. */
-    if (!page->mem_cgroup)
+    if (!page->mem_cgroup || is_page_smalltmpfs)
         goto resume_kstaled_work;
     //    lock_page_cgroup(pc);
     memcg = page->mem_cgroup;
@@ -6673,9 +6695,10 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
          * PageTransHuge may actually have been split (can be found out by
          * page->is_page_split).
          */
+
         if (page->is_page_cold) {
             /* Page is COLD. */
-            if (PageTransHuge(page)) {
+            if (PageTransHuge(page) || is_page_hugetmpfs) {
                 if (page->is_page_split) {
                     /* Page is huge but has split pmd. */
                     __update_memcg_hot_cold_bytes(page, memcg);
@@ -6687,7 +6710,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
             }
         } else {
             /* Page is HOT. */
-            if (PageTransHuge(page)) {
+            if (PageTransHuge(page) || is_page_hugetmpfs) {
                 if (page->is_page_split) {
                     /* Page is huge but has split pmd. */
                     __update_memcg_hot_cold_bytes(page, memcg);
@@ -6705,9 +6728,11 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
          * sampling the same number of bytes.
          */
         if (page->in_sampling_state)
-            memcg->num_sampled_bytes += PageTransHuge(page) ? 2097152 : 4096;
+            memcg->num_sampled_bytes += (PageTransHuge(page)
+                    || is_page_hugetmpfs) ? 2097152 : 4096;
 
-        memcg->num_scanned_bytes += PageTransHuge(page) ? 2097152 : 4096;
+        memcg->num_scanned_bytes += (PageTransHuge(page)
+                || is_page_hugetmpfs) ? 2097152 : 4096;
 
         /*
          * Sample the pages to be splitted. Split a random number of pages
