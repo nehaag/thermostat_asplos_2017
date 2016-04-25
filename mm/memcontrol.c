@@ -6767,7 +6767,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * We have only sampled huge pages. Suddenly they should not
                  * have become non-huge pages.
                  */
-                WARN_ON(!PageTransHuge(page));
+                WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
 
                 /*
                  * Reset the page to not be in sampling state. We will sample
@@ -6881,8 +6881,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * e) it is not the zero page.
              */
             if (memcg && random_number < memcg->poison_sampling_ratio
-                    && PageAnon(page)
-                    && PageTransHuge(page)
+//                    && PageAnon(page)
+                    && (PageTransHuge(page) || is_page_hugetmpfs)
                     && !PageHuge(page)
                     && !is_huge_zero_page(page)) {
 
@@ -6914,7 +6914,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * those small pages.
              */
             atomic_set(&page->num_accesses, 0);
-            if (PageTransHuge(page)) {
+            if (PageTransHuge(page) || is_page_hugetmpfs) {
                 for (offset = 0; offset < 512; offset++) {
                     atomic_set(&page[offset].num_accesses, 0);
                 }
