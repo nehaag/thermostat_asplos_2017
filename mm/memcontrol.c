@@ -7144,7 +7144,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                         + 1);
             if (access_fraction >= memcg->cold_memory_fraction) {
                 memcg->num_hot_page_threshold_adaptive = offset;
-                memcg->num_cold_page_threshold_adaptive = 0;
+                memcg->num_cold_page_threshold_adaptive = offset;
                 break;
             }
         }

@@ -825,7 +825,7 @@ bool page_check_address_transhuge(struct page *page, struct mm_struct *mm,
 		/* when pud is not present, pte will be NULL */
 		pte = huge_pte_offset(mm, address);
 		if (!pte)
-			return false;
+            return false;
 
 		ptl = huge_pte_lockptr(page_hstate(page), mm, pte);
 		pmd = NULL;
@@ -835,6 +835,7 @@ bool page_check_address_transhuge(struct page *page, struct mm_struct *mm,
 	pgd = pgd_offset(mm, address);
 	if (!pgd_present(*pgd))
 		return false;
+
 	pud = pud_offset(pgd, address);
 	if (!pud_present(*pud))
 		return false;
@@ -848,6 +849,7 @@ again:
 	if (pmd_trans_huge(pmdval)) {
 		if (pmd_page(pmdval) != page)
 			return false;
+
 		ptl = pmd_lock(mm, pmd);
 		if (unlikely(!pmd_same(*pmd, pmdval))) {
 			spin_unlock(ptl);
@@ -864,7 +866,7 @@ again:
 
 	pte = pte_offset_map(pmd, address);
 	if (!pte_present(*pte)) {
-		pte_unmap(pte);
+        pte_unmap(pte);
 		return false;
 	}
 
@@ -1213,7 +1215,7 @@ void page_poison(struct page *page, int is_locked, struct mem_cgroup *memcg,
     return;
 }
 
-static int collapse_ptes(struct mm_struct *mm,
+static int collapse_anon_ptes(struct mm_struct *mm,
         unsigned long address,
         struct vm_area_struct *vma,
         struct page *page,
@@ -1299,16 +1301,43 @@ static int collapse_ptes(struct mm_struct *mm,
     return 0;
 }
 
+static int collapse_file_ptes(struct mm_struct *mm,
+        unsigned long address,
+        struct vm_area_struct *vma,
+        struct page *page,
+        bool poison)
+{
+    pmd_t *pmd;
+    pte_t *pte;
+    spinlock_t *pte_ptl, *pml;
+
+	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &pte_ptl))
+        return 1;
+
+    spin_unlock(pte_ptl);
+    remap_team_by_pmd(vma, address, pmd, page);
+
+    /* TODO: if poison is true then poison the PMD. */
+	pml = pmd_lock(mm, pmd);
+    *pmd = pmd_mkreserve(*pmd);
+    spin_unlock(pml);
+
+    return 0;
+}
+
+
 static int page_collapse_one(struct page *page, struct vm_area_struct *vma,
         unsigned long address, void *arg)
 {
     struct mm_struct *mm = vma->vm_mm;
     bool *poison = arg;
 
-    if (!PageAnon(page))
+    if (PageAnon(page))
+        collapse_anon_ptes(mm, address, vma, page, *poison);
+    else if (PageTeam(page) && page->mapping && team_head(page))
+        collapse_file_ptes(mm, address, vma, page, *poison);
+    else
         return SWAP_FAIL;
-
-    collapse_ptes(mm, address, vma, page, *poison);
 
     return SWAP_AGAIN;
 }
@@ -1334,7 +1363,8 @@ void page_collapse_to_huge(struct page *page, int is_locked, bool poison)
         .arg = (void *)&poison_arg,
     };
 
-    if (!page_mapped(page))
+    if (!page_mapped(page) &&
+            !(PageTeam(page) && page->mapping && team_head(page)))
         return;
 
     if (!page_rmapping(page))
@@ -1354,7 +1384,8 @@ void page_collapse_to_huge(struct page *page, int is_locked, bool poison)
      * KSM pages.
      */
 //    rmap_walk(page, &rwc);
-    rmap_walk_anon(page, &rwc, true);
+//    rmap_walk_anon(page, &rwc, true);
+    rmap_walk_locked(page, &rwc);
 
     if (we_locked)
         unlock_page(page);
@@ -1371,6 +1402,8 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
 	spinlock_t *ptl;
     int *split_successful = (int*)arg;
 
+//    if (PageTeam(page) && page->mapping && team_head(page))
+//        goto split;
 	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl)) {
         *split_successful &= 0;
 		return SWAP_AGAIN;
@@ -1379,7 +1412,7 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
 	if (vma->vm_flags & VM_LOCKED) {
 		if (pte)
 			pte_unmap(pte);
-		spin_unlock(ptl);
+        spin_unlock(ptl);
         *split_successful &= 0;
 		return SWAP_FAIL; /* To break the loop */
 	}
@@ -1391,7 +1424,7 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
     }
 
     /*
-     * Here we un-reserve PMD before splitting to svoid the race condition
+     * Here we un-reserve PMD before splitting to void the race condition
      * between a page being split and handling badgertrap fault to the same
      * page. We will poison PTEs later. With this fix we have made this page
      * temprarily hot, hoping there will not be many pages like that.
@@ -1406,6 +1439,7 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
 
     spin_unlock(ptl);
 
+//split:
     split_huge_pmd(vma, pmd, address);
     if(!pmd_trans_huge(*pmd)) {
         *split_successful &= 1;
@@ -1456,13 +1490,12 @@ int page_split_for_sampling(struct page *page, int is_locked)
         .arg = &all_split_successful
     };
 
-    if (!page_mapped(page)) {
+    if (!page_mapped(page) &&
+            !(PageTeam(page) && page->mapping && team_head(page)))
         return SWAP_FAIL;
-    }
 
-    if (!page_rmapping(page)) {
+    if (!page_rmapping(page))
         return 1;
-    }
 
     if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
         we_locked = trylock_page(page);
@@ -1471,7 +1504,10 @@ int page_split_for_sampling(struct page *page, int is_locked)
         }
     }
 
-    if (PageKsm(page) || !PageTransHuge(page)) {
+    if (PageKsm(page) ||
+            !(PageTransHuge(page) ||
+              (PageTeam(page) && page->mapping && team_head(page))
+             )) {
         if (we_locked)
             unlock_page(page);
         return 1;
