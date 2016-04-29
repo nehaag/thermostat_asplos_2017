@@ -6810,7 +6810,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * tag small pages inside it as cold/hot.
                  */
                 if (num_hot_small_pages >=
-                        memcg->num_hot_page_threshold_adaptive) {
+                        memcg->num_hot_page_threshold) {
                     /* This huge page is HOT, so we should collapse it. */
                     page->in_sampling_state = 0;
                     page->is_page_cold = false;
@@ -6820,7 +6820,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         small_page->is_page_cold = false;
                     }
                 } else if(num_hot_small_pages <
-                        memcg->num_cold_page_threshold_adaptive) {
+                        memcg->num_cold_page_threshold) {
                     /*
                      * This huge page is COLD, collapse this as well. Also
                      * poison it so that accesses to this page are slowed down
