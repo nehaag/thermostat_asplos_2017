@@ -970,6 +970,7 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 	pte_t *pte;
 	spinlock_t *ptl;
 	int referenced = 0;
+    bool is_page_hugetmpfs = false;
 
 	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl))
 		return SWAP_AGAIN;
@@ -986,8 +987,14 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
 
     /* In this case the page is a small page or a split huge page */
 	if (pte) {
-        if (PageTransHuge(page) && (pra->pr_flags & PR_FOR_KSTALED)) {
-            /* 
+        is_page_hugetmpfs = !PageAnon(page) && PageTeam(page)
+                            && page->mapping && (page == team_head(page));
+//        if (PageTransHuge(page)
+        if ((PageTransHuge(page) || is_page_hugetmpfs)
+                && page->is_page_split
+                && (pra->pr_flags & PR_FOR_KSTALED)) {
+
+            /*
              * In this case it is a split huge page. All the PTEs are stored
              * consecutively in the same memory region, so we can simply check
              * them one by one.
@@ -1241,8 +1248,15 @@ static int collapse_anon_ptes(struct mm_struct *mm,
         return 1;
     }
     BUG_ON(!pmd);
-    if (pmd_trans_huge(*pmd))
+    if (pmd_trans_huge(*pmd)) {
         printk("Collapsing huge PMD : %lx\n", pmd_val(*pmd));
+
+        /* Release the locks. */
+        spin_unlock(pte_ptl);
+        anon_vma_unlock_write(vma->anon_vma);
+        up_write(&mm->mmap_sem);
+        return 1;
+    }
     BUG_ON(pmd_trans_huge(*pmd));
 
     /* Do pmdp_collapse_flush and mmu_notifier. */
@@ -1318,9 +1332,14 @@ static int collapse_file_ptes(struct mm_struct *mm,
     remap_team_by_pmd(vma, address, pmd, page);
 
     /* TODO: if poison is true then poison the PMD. */
-	pml = pmd_lock(mm, pmd);
-    *pmd = pmd_mkreserve(*pmd);
-    spin_unlock(pml);
+    if (poison) {
+        pml = pmd_lock(mm, pmd);
+        *pmd = pmd_mkreserve(*pmd);
+        spin_unlock(pml);
+    }
+
+    /* Reset is_page_split flag. */
+    page->is_page_split = 0;
 
     return 0;
 }
@@ -1334,7 +1353,8 @@ static int page_collapse_one(struct page *page, struct vm_area_struct *vma,
 
     if (PageAnon(page))
         collapse_anon_ptes(mm, address, vma, page, *poison);
-    else if (PageTeam(page) && page->mapping && team_head(page))
+    else if (PageTeam(page) && page->mapping &&
+            (page == team_head(page)))
         collapse_file_ptes(mm, address, vma, page, *poison);
     else
         return SWAP_FAIL;
@@ -1401,9 +1421,11 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
 	pte_t *pte;
 	spinlock_t *ptl;
     int *split_successful = (int*)arg;
+    int i = 0;
 
-//    if (PageTeam(page) && page->mapping && team_head(page))
-//        goto split;
+    bool is_page_hugetmpfs = !PageAnon(page) && PageTeam(page) && page->mapping
+        && (page==team_head(page));
+
 	if (!page_check_address_transhuge(page, mm, address, &pmd, &pte, &ptl)) {
         *split_successful &= 0;
 		return SWAP_AGAIN;
@@ -1439,7 +1461,6 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
 
     spin_unlock(ptl);
 
-//split:
     split_huge_pmd(vma, pmd, address);
     if(!pmd_trans_huge(*pmd)) {
         *split_successful &= 1;
@@ -1451,7 +1472,6 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
          */
         if (pmd_was_reserved && page_check_address_transhuge(page, mm, address,
                     &pmd, &pte, &ptl)) {
-            int i;
             for (i = 0; i < HPAGE_PMD_NR; i++) {
                 pte_t *pte_num = pte + i;
                 *pte_num = pte_mkreserve(*pte_num);
@@ -1467,6 +1487,7 @@ static int page_split_one(struct page *page, struct vm_area_struct *vma,
             *pmd = pmd_unreserve(*pmd);
             spin_unlock(ptl);
         }
+        *split_successful &= 0;
     }
 
     return SWAP_AGAIN;
@@ -1489,28 +1510,20 @@ int page_split_for_sampling(struct page *page, int is_locked)
         .anon_lock = page_lock_anon_vma_read,
         .arg = &all_split_successful
     };
+    bool is_page_hugetmpfs = !PageAnon(page) && PageTeam(page)
+                            && page->mapping && (page == team_head(page));
 
-    if (!page_mapped(page) &&
-            !(PageTeam(page) && page->mapping && team_head(page)))
-        return SWAP_FAIL;
+    if (!(page_mapped(page) || is_page_hugetmpfs)) {
+        return 0;
+    }
 
     if (!page_rmapping(page))
-        return 1;
+        return 0;
 
     if (!is_locked && (!PageAnon(page) || PageKsm(page))) {
         we_locked = trylock_page(page);
-        if (!we_locked) {
-            return 1;
-        }
-    }
-
-    if (PageKsm(page) ||
-            !(PageTransHuge(page) ||
-              (PageTeam(page) && page->mapping && team_head(page))
-             )) {
-        if (we_locked)
-            unlock_page(page);
-        return 1;
+        if (!we_locked)
+            return 0;
     }
 
     ret = rmap_walk(page, &rwc);

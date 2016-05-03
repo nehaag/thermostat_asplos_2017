@@ -3866,7 +3866,9 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_hot_bytes %lu\n", memcg->num_hot_bytes_printed);
     seq_printf(sf, "num_hot_huge_bytes %lu\n", memcg->num_hot_huge_bytes_printed);
     seq_printf(sf, "num_sampled_bytes %lu\n", memcg->num_sampled_bytes_printed);
+    seq_printf(sf, "num_split_sampled_bytes %lu\n", memcg->num_split_sampled_bytes_printed);
     seq_printf(sf, "num_scanned_bytes %lu\n", memcg->num_scanned_bytes_printed);
+    seq_printf(sf, "num_mapped_bytes %lu\n", memcg->num_mapped_bytes_printed);
     seq_printf(sf, "diff_scanned_hot_cold_bytes %ld\n",
             memcg->num_scanned_bytes_printed -
             (memcg->num_cold_bytes_printed + memcg->num_cold_huge_bytes_printed +
@@ -3969,8 +3971,12 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_hot_huge_bytes_printed = 0;
     memcg->num_sampled_bytes = 0;
     memcg->num_sampled_bytes_printed = 0;
+    memcg->num_split_sampled_bytes = 0;
+    memcg->num_split_sampled_bytes_printed = 0;
     memcg->num_scanned_bytes = 0;
     memcg->num_scanned_bytes_printed = 0;
+    memcg->num_mapped_bytes = 0;
+    memcg->num_mapped_bytes_printed = 0;
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
     memcg->num_badgerTrap_faults_cold_printed = 0;
     atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
@@ -6655,6 +6661,11 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
     }
 
     /* Find out if the page is idle. Also test for pending mlock. */
+    /*
+     * TODO: right now small tmpfs page will not be scanned. Only anonymous
+     * pages and huge tmpfs will be scanned.
+     */
+//    if (PageAnon(page) || is_page_hugetmpfs)
     if (!is_page_smalltmpfs)
         page_referenced_kstaled(page, is_locked, &info);
 
@@ -6696,29 +6707,22 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
          * page->is_page_split).
          */
 
-        if (page->is_page_cold) {
-            /* Page is COLD. */
+        if (page_mapped(page)) {
             if (PageTransHuge(page) || is_page_hugetmpfs) {
                 if (page->is_page_split) {
                     /* Page is huge but has split pmd. */
                     __update_memcg_hot_cold_bytes(page, memcg);
                 } else {
-                    memcg->num_cold_huge_bytes += 2097152;
+                    if (page->is_page_cold)
+                        memcg->num_cold_huge_bytes += 2097152;
+                    else
+                        memcg->num_hot_huge_bytes += 2097152;
                 }
             } else {
-                memcg->num_cold_bytes += 4096;
-            }
-        } else {
-            /* Page is HOT. */
-            if (PageTransHuge(page) || is_page_hugetmpfs) {
-                if (page->is_page_split) {
-                    /* Page is huge but has split pmd. */
-                    __update_memcg_hot_cold_bytes(page, memcg);
-                } else {
-                    memcg->num_hot_huge_bytes += 2097152;
-                }
-            } else {
-                memcg->num_hot_bytes += 4096;
+                if (page->is_page_cold)
+                    memcg->num_cold_bytes += 4096;
+                else
+                    memcg->num_hot_bytes += 4096;
             }
         }
 
@@ -6731,8 +6735,17 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
             memcg->num_sampled_bytes += (PageTransHuge(page)
                     || is_page_hugetmpfs) ? 2097152 : 4096;
 
+        if (page->in_sampling_state && page->is_page_split)
+            memcg->num_split_sampled_bytes += (PageTransHuge(page)
+                    || is_page_hugetmpfs) ? 2097152 : 4096;
+
         memcg->num_scanned_bytes += (PageTransHuge(page)
                 || is_page_hugetmpfs) ? 2097152 : 4096;
+
+        if (page_mapped(page)) {
+            memcg->num_mapped_bytes += (PageTransHuge(page)
+                    || is_page_hugetmpfs) ? 2097152 : 4096;
+        }
 
         /*
          * Sample the pages to be splitted. Split a random number of pages
@@ -6761,7 +6774,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * Find out if the page has been sampled in the *previous* sampling
              * period.
              */
-            if (page->in_sampling_state) {
+            if (page->in_sampling_state && page->is_page_split) {
 
                 /*
                  * We have only sampled huge pages. Suddenly they should not
@@ -6844,12 +6857,14 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                      */
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
+                        small_page->in_sampling_state = 0;
                         int read_num_accesses = atomic_read(&small_page->num_accesses);
 
                         if (read_num_accesses < memcg->hotspot_hot_page_threshold) {
                             /* poison this small page */
                             page_poison(small_page, is_locked, NULL, true);
                             small_page->is_page_cold = true;
+                            trace_printk("read_num_accesses:%d\n", read_num_accesses);
                         } else {
                             small_page->is_page_cold = false;
                         }
@@ -7096,8 +7111,12 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     memcg->num_hot_huge_bytes = 0;
     memcg->num_sampled_bytes_printed = memcg->num_sampled_bytes;
     memcg->num_sampled_bytes = 0;
+    memcg->num_split_sampled_bytes_printed = memcg->num_split_sampled_bytes;
+    memcg->num_split_sampled_bytes = 0;
     memcg->num_scanned_bytes_printed = memcg->num_scanned_bytes;
     memcg->num_scanned_bytes = 0;
+    memcg->num_mapped_bytes_printed = memcg->num_mapped_bytes;
+    memcg->num_mapped_bytes = 0;
     memcg->num_badgerTrap_faults_cold_printed = atomic_read(
             &memcg->num_badgerTrap_faults_cold);
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);

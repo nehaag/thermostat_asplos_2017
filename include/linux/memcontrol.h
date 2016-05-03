@@ -317,8 +317,12 @@ struct mem_cgroup {
     unsigned long num_hot_huge_bytes_printed;
     unsigned long num_sampled_bytes;
     unsigned long num_sampled_bytes_printed;
+    unsigned long num_split_sampled_bytes;
+    unsigned long num_split_sampled_bytes_printed;
     unsigned long num_scanned_bytes;
     unsigned long num_scanned_bytes_printed;
+    unsigned long num_mapped_bytes;
+    unsigned long num_mapped_bytes_printed;
     unsigned int num_access_distribution[50];
     unsigned int num_access_distribution_printed[50];
     atomic_t num_badgerTrap_faults_cold;
