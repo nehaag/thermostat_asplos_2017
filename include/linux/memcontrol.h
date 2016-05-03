@@ -307,6 +307,8 @@ struct mem_cgroup {
     int num_hot_page_threshold_adaptive;
     int num_cold_page_threshold_adaptive;
     int cold_memory_fraction;
+    int num_collapse_failed_hot;
+    int num_collapse_failed_cold;
     unsigned long num_cold_bytes;
     unsigned long num_cold_bytes_printed;
     unsigned long num_cold_huge_bytes;

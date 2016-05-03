@@ -1400,11 +1400,7 @@ void page_collapse_to_huge(struct page *page, int is_locked, bool poison)
     if (PageKsm(page))
         return;
 
-    /* TODO For now only collapse the anonymous pages. Add support for file and
-     * KSM pages.
-     */
-//    rmap_walk(page, &rwc);
-//    rmap_walk_anon(page, &rwc, true);
+    /* For now only collapse the anonymous and file pages. */
     rmap_walk_locked(page, &rwc);
 
     if (we_locked)

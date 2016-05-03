@@ -3903,6 +3903,11 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_cold_page_threshold_adaptive %d\n",
             memcg->num_cold_page_threshold_adaptive);
 
+    seq_printf(sf, "num_collapse_failed_hot %d\n",
+            memcg->num_collapse_failed_hot);
+    seq_printf(sf, "num_collapse_failed_cold %d\n",
+            memcg->num_collapse_failed_cold);
+
 //    seq_printf(sf, "access_corr\n");
 //    for (bucket = 0; bucket < 11; bucket++) {
 //        for(bucket2 = 0; bucket2 < 11; bucket2++) {
@@ -3987,6 +3992,8 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_badgerTrap_faults_sampled_printed = 0;
     memcg->num_hot_page_threshold_adaptive = memcg->num_hot_page_threshold;
     memcg->num_cold_page_threshold_adaptive = memcg->num_cold_page_threshold;
+    memcg->num_collapse_failed_hot = 0;
+    memcg->num_collapse_failed_cold = 0;
 
     return 0;
 }
@@ -6828,6 +6835,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page->in_sampling_state = 0;
                     page->is_page_cold = false;
                     page_collapse_to_huge(page, is_locked, false);
+                    memcg->num_collapse_failed_hot += page->is_page_split
+                                                        ? 1 : 0;
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
                         small_page->is_page_cold = false;
@@ -6842,6 +6851,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page->is_page_cold = true;
                     page->in_sampling_state = 0;
                     page_collapse_to_huge(page, is_locked, true);
+                    memcg->num_collapse_failed_cold += page->is_page_split
+                                                        ? 1 : 0;
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
                         small_page->is_page_cold = true;
@@ -6864,7 +6875,6 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                             /* poison this small page */
                             page_poison(small_page, is_locked, NULL, true);
                             small_page->is_page_cold = true;
-                            trace_printk("read_num_accesses:%d\n", read_num_accesses);
                         } else {
                             small_page->is_page_cold = false;
                         }
