@@ -307,6 +307,7 @@ struct mem_cgroup {
     int num_hot_page_threshold_adaptive;
     int num_cold_page_threshold_adaptive;
     int cold_memory_fraction;
+    int hotspot_memory_fraction;
     int num_collapse_failed_hot;
     int num_collapse_failed_cold;
     unsigned long num_cold_bytes;
@@ -325,6 +326,8 @@ struct mem_cgroup {
     unsigned long num_scanned_bytes_printed;
     unsigned long num_mapped_bytes;
     unsigned long num_mapped_bytes_printed;
+    unsigned long num_small_file_allocated_bytes;
+    unsigned long num_small_file_allocated_bytes_printed;
     unsigned int num_access_distribution[50];
     unsigned int num_access_distribution_printed[50];
     atomic_t num_badgerTrap_faults_cold;

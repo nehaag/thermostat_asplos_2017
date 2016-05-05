@@ -3869,6 +3869,7 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_split_sampled_bytes %lu\n", memcg->num_split_sampled_bytes_printed);
     seq_printf(sf, "num_scanned_bytes %lu\n", memcg->num_scanned_bytes_printed);
     seq_printf(sf, "num_mapped_bytes %lu\n", memcg->num_mapped_bytes_printed);
+    seq_printf(sf, "num_small_file_allocated_bytes %lu\n", memcg->num_small_file_allocated_bytes_printed);
     seq_printf(sf, "diff_scanned_hot_cold_bytes %ld\n",
             memcg->num_scanned_bytes_printed -
             (memcg->num_cold_bytes_printed + memcg->num_cold_huge_bytes_printed +
@@ -3982,6 +3983,8 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_scanned_bytes_printed = 0;
     memcg->num_mapped_bytes = 0;
     memcg->num_mapped_bytes_printed = 0;
+    memcg->num_small_file_allocated_bytes = 0;
+    memcg->num_small_file_allocated_bytes_printed = 0;
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
     memcg->num_badgerTrap_faults_cold_printed = 0;
     atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
@@ -4142,6 +4145,27 @@ static int mem_cgroup_cold_memory_fraction_write(struct cgroup_subsys_state *css
         return -EINVAL;
 
     memcg->cold_memory_fraction = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_hotspot_memory_fraction_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->hotspot_memory_fraction;
+}
+
+static int mem_cgroup_hotspot_memory_fraction_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < -1)
+        return -EINVAL;
+
+    memcg->hotspot_memory_fraction = val;
 
     return 0;
 }
@@ -4517,6 +4541,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.read_s64 = mem_cgroup_cold_memory_fraction_read,
 		.write_s64 = mem_cgroup_cold_memory_fraction_write,
 	},
+    {
+        .name = "hotspot_memory_fraction",
+        .read_s64 = mem_cgroup_hotspot_memory_fraction_read,
+        .write_s64 = mem_cgroup_hotspot_memory_fraction_write,
+    },
     {
 		.name = "hot_small_page_threshold",
 		.read_s64 = mem_cgroup_hot_small_page_threshold_read,
@@ -6752,6 +6781,12 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
         if (page_mapped(page)) {
             memcg->num_mapped_bytes += (PageTransHuge(page)
                     || is_page_hugetmpfs) ? 2097152 : 4096;
+
+            /* File pages will be only small 4KB pages if not mapped to
+             * hugetmpfs. Count 4KB allocated file pages that were never huge.
+             * */
+            if (!(PageAnon(page) || is_page_hugetmpfs))
+                memcg->num_small_file_allocated_bytes += 4096;
         }
 
         /*
@@ -6829,8 +6864,9 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * Tag huge page as cold/hot or if huge page is a hotspot page,
                  * tag small pages inside it as cold/hot.
                  */
-                if (num_hot_small_pages >
-                        memcg->num_hot_page_threshold_adaptive) {
+                if (num_hot_small_pages == 512 ||
+                        (num_hot_small_pages >
+                         memcg->num_hot_page_threshold_adaptive)) {
                     /* This huge page is HOT, so we should collapse it. */
                     page->in_sampling_state = 0;
                     page->is_page_cold = false;
@@ -6840,6 +6876,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
                         small_page->is_page_cold = false;
+                        atomic_set(&small_page->num_accesses, 0);
                     }
                 } else if(num_hot_small_pages <=
                         memcg->num_cold_page_threshold_adaptive) {
@@ -6856,6 +6893,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
                         small_page->is_page_cold = true;
+                        atomic_set(&small_page->num_accesses, 0);
                     }
                 } else {
                     /*
@@ -6875,8 +6913,10 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                             /* poison this small page */
                             page_poison(small_page, is_locked, NULL, true);
                             small_page->is_page_cold = true;
+                            atomic_set(&small_page->num_accesses, 0);
                         } else {
                             small_page->is_page_cold = false;
+                            atomic_set(&small_page->num_accesses, 0);
                         }
                     }
                 }
@@ -7127,6 +7167,9 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     memcg->num_scanned_bytes = 0;
     memcg->num_mapped_bytes_printed = memcg->num_mapped_bytes;
     memcg->num_mapped_bytes = 0;
+    memcg->num_small_file_allocated_bytes_printed =
+        memcg->num_small_file_allocated_bytes;
+    memcg->num_small_file_allocated_bytes = 0;
     memcg->num_badgerTrap_faults_cold_printed = atomic_read(
             &memcg->num_badgerTrap_faults_cold);
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
@@ -7177,6 +7220,21 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                 break;
             }
         }
+
+        for (; offset < 513; offset++) {
+            access_fraction =
+                (memcg->page_access_cummulative_distribution[offset]
+                 * 100)
+                / (memcg->page_access_cummulative_distribution[512]
+                        + 1);
+ 
+            if (access_fraction >=
+                 memcg->cold_memory_fraction + memcg->hotspot_memory_fraction) {
+                memcg->num_hot_page_threshold_adaptive = offset;
+                break;
+            }
+        }
+
         memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
     }
 #endif /* CONFIG_POISON_PAGE */
