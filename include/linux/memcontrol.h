@@ -311,6 +311,10 @@ struct mem_cgroup {
     int num_collapse_failed_hot;
     int num_collapse_failed_cold;
     uint64_t num_migration_bytes;
+    uint64_t num_cold_small_bytes_kstaled;
+    uint64_t num_cold_small_bytes_kstaled_printed;
+    uint64_t num_cold_huge_bytes_kstaled;
+    uint64_t num_cold_huge_bytes_kstaled_printed;
     unsigned long num_cold_bytes;
     unsigned long num_cold_bytes_printed;
     unsigned long num_cold_huge_bytes;

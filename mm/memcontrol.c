@@ -3912,6 +3912,11 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_migration_bytes %llu\n",
             memcg->num_migration_bytes);
 
+    seq_printf(sf, "num_cold_huge_bytes_kstaled %llu\n",
+        memcg->num_cold_huge_bytes_kstaled_printed);
+    seq_printf(sf, "num_cold_small_bytes_kstaled %llu\n",
+        memcg->num_cold_small_bytes_kstaled_printed);
+
 //    seq_printf(sf, "access_corr\n");
 //    for (bucket = 0; bucket < 11; bucket++) {
 //        for(bucket2 = 0; bucket2 < 11; bucket2++) {
@@ -4001,6 +4006,10 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_collapse_failed_hot = 0;
     memcg->num_collapse_failed_cold = 0;
     memcg->num_migration_bytes = 0;
+    memcg->num_cold_small_bytes_kstaled = 0;
+    memcg->num_cold_small_bytes_kstaled_printed = 0;
+    memcg->num_cold_huge_bytes_kstaled = 0;
+    memcg->num_cold_huge_bytes_kstaled_printed = 0;
 
     return 0;
 }
@@ -6711,10 +6720,10 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
 #ifdef CONFIG_POISON_PAGE
     /* Locate if poison bit is enabled for the page's mem_cgroup. */
+    memcg = page->mem_cgroup;
     if (!page->mem_cgroup || is_page_smalltmpfs)
         goto resume_kstaled_work;
     //    lock_page_cgroup(pc);
-    memcg = page->mem_cgroup;
     unsigned int start_new_sampling_period = 0;
     unsigned int offset = 0;
 
@@ -7014,6 +7023,22 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 #endif /* CONFIG_POISON_PAGE */
 
 resume_kstaled_work:
+    if(memcg->poison_sampling_period
+            && (memcg->idle_page_scans % memcg->poison_sampling_period  == 0)
+            && !memcg->enable_poison_page) {
+        int read_num_accesses = atomic_read(&page->num_accesses);
+        if(read_num_accesses < memcg->hot_small_page_threshold) {
+            memcg->num_cold_small_bytes_kstaled += 4096;
+            /*
+             * Compute the number of huge cold pages.
+             */
+            if(PageTransHuge(page) || is_page_hugetmpfs) {
+                memcg->num_cold_huge_bytes_kstaled += 2097152;
+            }
+        }
+        atomic_set(&page->num_accesses, 0);
+    }
+
     /*
      * TODO: This is kstaled page age accounting logic. Figure out if we need
      * this, and if we do, if we need to fix this.
@@ -7259,6 +7284,17 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 
         memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
     }
+
+    if(memcg->poison_sampling_period
+            && (memcg->idle_page_scans % memcg->poison_sampling_period  == 0)) {
+        memcg->num_cold_small_bytes_kstaled_printed =
+            memcg->num_cold_small_bytes_kstaled;
+        memcg->num_cold_small_bytes_kstaled = 0;
+        memcg->num_cold_huge_bytes_kstaled_printed =
+            memcg->num_cold_huge_bytes_kstaled;
+        memcg->num_cold_huge_bytes_kstaled = 0;
+    }
+
 #endif /* CONFIG_POISON_PAGE */
 }
 
