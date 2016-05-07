@@ -310,6 +310,7 @@ struct mem_cgroup {
     int hotspot_memory_fraction;
     int num_collapse_failed_hot;
     int num_collapse_failed_cold;
+    uint64_t num_migration_bytes;
     unsigned long num_cold_bytes;
     unsigned long num_cold_bytes_printed;
     unsigned long num_cold_huge_bytes;

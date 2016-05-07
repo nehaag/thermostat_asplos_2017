@@ -3909,6 +3909,9 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_collapse_failed_cold %d\n",
             memcg->num_collapse_failed_cold);
 
+    seq_printf(sf, "num_migration_bytes %llu\n",
+            memcg->num_migration_bytes);
+
 //    seq_printf(sf, "access_corr\n");
 //    for (bucket = 0; bucket < 11; bucket++) {
 //        for(bucket2 = 0; bucket2 < 11; bucket2++) {
@@ -3997,6 +4000,7 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_cold_page_threshold_adaptive = memcg->num_cold_page_threshold;
     memcg->num_collapse_failed_hot = 0;
     memcg->num_collapse_failed_cold = 0;
+    memcg->num_migration_bytes = 0;
 
     return 0;
 }
@@ -6873,11 +6877,18 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page_collapse_to_huge(page, is_locked, false);
                     memcg->num_collapse_failed_hot += page->is_page_split
                                                         ? 1 : 0;
+
+                    bool found_atleast_one_cold_page = false;
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
+                        if (small_page->is_page_cold)
+                            found_atleast_one_cold_page = true;
                         small_page->is_page_cold = false;
                         atomic_set(&small_page->num_accesses, 0);
                     }
+
+                    if (found_atleast_one_cold_page)
+                        memcg->num_migration_bytes += 2097152;
                 } else if(num_hot_small_pages <=
                         memcg->num_cold_page_threshold_adaptive) {
                     /*
@@ -6890,11 +6901,18 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page_collapse_to_huge(page, is_locked, true);
                     memcg->num_collapse_failed_cold += page->is_page_split
                                                         ? 1 : 0;
+
+                    bool found_atleast_one_hot_page = false;
                     for (offset = 0; offset < 512; offset++) {
                         struct page *small_page = page + offset;
+                        if (!small_page->is_page_cold)
+                            found_atleast_one_hot_page = true;
                         small_page->is_page_cold = true;
                         atomic_set(&small_page->num_accesses, 0);
                     }
+
+                    if (found_atleast_one_hot_page)
+                        memcg->num_migration_bytes += 2097152;
                 } else {
                     /*
                      * This huge page is hotspot. Since the huge page PMD is
@@ -6912,9 +6930,13 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         if (read_num_accesses < memcg->hotspot_hot_page_threshold) {
                             /* poison this small page */
                             page_poison(small_page, is_locked, NULL, true);
+                            if (!small_page->is_page_cold)
+                                memcg->num_migration_bytes += 4096;
                             small_page->is_page_cold = true;
                             atomic_set(&small_page->num_accesses, 0);
                         } else {
+                            if (small_page->is_page_cold)
+                                memcg->num_migration_bytes += 4096;
                             small_page->is_page_cold = false;
                             atomic_set(&small_page->num_accesses, 0);
                         }
