@@ -315,14 +315,35 @@ struct mem_cgroup {
     uint64_t num_cold_small_bytes_kstaled_printed;
     uint64_t num_cold_huge_bytes_kstaled;
     uint64_t num_cold_huge_bytes_kstaled_printed;
+
     unsigned long num_cold_bytes;
     unsigned long num_cold_bytes_printed;
     unsigned long num_cold_huge_bytes;
     unsigned long num_cold_huge_bytes_printed;
+
+    unsigned long num_cold_anon_bytes;
+    unsigned long num_cold_anon_bytes_printed;
+    unsigned long num_cold_huge_anon_bytes;
+    unsigned long num_cold_huge_anon_bytes_printed;
+    unsigned long num_cold_file_bytes;
+    unsigned long num_cold_file_bytes_printed;
+    unsigned long num_cold_huge_file_bytes;
+    unsigned long num_cold_huge_file_bytes_printed;
+
     unsigned long num_hot_bytes;
     unsigned long num_hot_bytes_printed;
     unsigned long num_hot_huge_bytes;
     unsigned long num_hot_huge_bytes_printed;
+
+    unsigned long num_hot_anon_bytes;
+    unsigned long num_hot_anon_bytes_printed;
+    unsigned long num_hot_huge_anon_bytes;
+    unsigned long num_hot_huge_anon_bytes_printed;
+    unsigned long num_hot_file_bytes;
+    unsigned long num_hot_file_bytes_printed;
+    unsigned long num_hot_huge_file_bytes;
+    unsigned long num_hot_huge_file_bytes_printed;
+
     unsigned long num_sampled_bytes;
     unsigned long num_sampled_bytes_printed;
     unsigned long num_split_sampled_bytes;

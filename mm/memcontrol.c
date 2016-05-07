@@ -3862,9 +3862,21 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
 #ifdef CONFIG_POISON_PAGE
     /* Print number of cold bytes*/
     seq_printf(sf, "num_cold_bytes %lu\n", memcg->num_cold_bytes_printed);
+    seq_printf(sf, "num_cold_anon_bytes %lu\n", memcg->num_cold_anon_bytes_printed);
+    seq_printf(sf, "num_cold_file_bytes %lu\n", memcg->num_cold_file_bytes_printed);
+
     seq_printf(sf, "num_cold_huge_bytes %lu\n", memcg->num_cold_huge_bytes_printed);
+    seq_printf(sf, "num_cold_huge_anon_bytes %lu\n", memcg->num_cold_huge_anon_bytes_printed);
+    seq_printf(sf, "num_cold_huge_file_bytes %lu\n", memcg->num_cold_huge_file_bytes_printed);
+
     seq_printf(sf, "num_hot_bytes %lu\n", memcg->num_hot_bytes_printed);
+    seq_printf(sf, "num_hot_anon_bytes %lu\n", memcg->num_hot_anon_bytes_printed);
+    seq_printf(sf, "num_hot_file_bytes %lu\n", memcg->num_hot_file_bytes_printed);
+
     seq_printf(sf, "num_hot_huge_bytes %lu\n", memcg->num_hot_huge_bytes_printed);
+    seq_printf(sf, "num_hot_huge_anon_bytes %lu\n", memcg->num_hot_huge_anon_bytes_printed);
+    seq_printf(sf, "num_hot_huge_file_bytes %lu\n", memcg->num_hot_huge_file_bytes_printed);
+
     seq_printf(sf, "num_sampled_bytes %lu\n", memcg->num_sampled_bytes_printed);
     seq_printf(sf, "num_split_sampled_bytes %lu\n", memcg->num_split_sampled_bytes_printed);
     seq_printf(sf, "num_scanned_bytes %lu\n", memcg->num_scanned_bytes_printed);
@@ -6597,10 +6609,19 @@ static void __update_memcg_hot_cold_bytes(struct page* page,
     unsigned offset;
     for (offset = 0; offset < 512; offset++) {
         struct page *small_page = page + offset;
-        if (small_page->is_page_cold)
+        if (small_page->is_page_cold) {
             memcg->num_cold_bytes += 4096;
-        else
+            if (PageAnon(page))
+                memcg->num_cold_anon_bytes += 4096;
+            else
+                memcg->num_cold_file_bytes += 4096;
+        } else {
             memcg->num_hot_bytes += 4096;
+            if (PageAnon(page))
+                memcg->num_hot_anon_bytes += 4096;
+            else
+                memcg->num_hot_file_bytes += 4096;
+        }
     }
 }
 
@@ -6762,16 +6783,34 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     /* Page is huge but has split pmd. */
                     __update_memcg_hot_cold_bytes(page, memcg);
                 } else {
-                    if (page->is_page_cold)
+                    if (page->is_page_cold) {
                         memcg->num_cold_huge_bytes += 2097152;
-                    else
+                        if (PageAnon(page))
+                            memcg->num_cold_huge_anon_bytes += 2097152;
+                        else
+                            memcg->num_cold_huge_file_bytes += 2097152;
+                    } else {
                         memcg->num_hot_huge_bytes += 2097152;
+                        if (PageAnon(page))
+                            memcg->num_hot_huge_anon_bytes += 2097152;
+                        else
+                            memcg->num_hot_huge_file_bytes += 2097152;
+                    }
                 }
             } else {
-                if (page->is_page_cold)
+                if (page->is_page_cold) {
                     memcg->num_cold_bytes += 4096;
-                else
+                    if (PageAnon(page))
+                        memcg->num_cold_anon_bytes += 4096;
+                    else
+                        memcg->num_cold_file_bytes += 4096;
+                } else {
                     memcg->num_hot_bytes += 4096;
+                    if (PageAnon(page))
+                        memcg->num_hot_anon_bytes += 4096;
+                    else
+                        memcg->num_hot_file_bytes += 4096;
+                }
             }
         }
 
@@ -7202,10 +7241,30 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     memcg->num_cold_bytes = 0;
     memcg->num_cold_huge_bytes_printed = memcg->num_cold_huge_bytes;
     memcg->num_cold_huge_bytes = 0;
+
+    memcg->num_cold_anon_bytes_printed = memcg->num_cold_anon_bytes;
+    memcg->num_cold_anon_bytes = 0;
+    memcg->num_cold_file_bytes_printed = memcg->num_cold_file_bytes;
+    memcg->num_cold_file_bytes = 0;
+    memcg->num_cold_huge_anon_bytes_printed = memcg->num_cold_huge_anon_bytes;
+    memcg->num_cold_huge_anon_bytes = 0;
+    memcg->num_cold_huge_file_bytes_printed = memcg->num_cold_huge_file_bytes;
+    memcg->num_cold_huge_file_bytes = 0;
+
     memcg->num_hot_bytes_printed = memcg->num_hot_bytes;
     memcg->num_hot_bytes = 0;
     memcg->num_hot_huge_bytes_printed = memcg->num_hot_huge_bytes;
     memcg->num_hot_huge_bytes = 0;
+
+    memcg->num_hot_anon_bytes_printed = memcg->num_hot_anon_bytes;
+    memcg->num_hot_anon_bytes = 0;
+    memcg->num_hot_file_bytes_printed = memcg->num_hot_file_bytes;
+    memcg->num_hot_file_bytes = 0;
+    memcg->num_hot_huge_anon_bytes_printed = memcg->num_hot_huge_anon_bytes;
+    memcg->num_hot_huge_anon_bytes = 0;
+    memcg->num_hot_huge_file_bytes_printed = memcg->num_hot_huge_file_bytes;
+    memcg->num_hot_huge_file_bytes = 0;
+
     memcg->num_sampled_bytes_printed = memcg->num_sampled_bytes;
     memcg->num_sampled_bytes = 0;
     memcg->num_split_sampled_bytes_printed = memcg->num_split_sampled_bytes;
