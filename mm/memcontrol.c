@@ -3965,6 +3965,27 @@ static int mem_cgroup_stale_page_age_write(struct cgroup_subsys_state *css,
 #endif /* CONFIG_KSTALED */
 
 #ifdef CONFIG_POISON_PAGE
+static u64 mem_cgroup_enable_poison_page_4kb_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->enable_poison_page_4kb;
+}
+
+static int mem_cgroup_enable_poison_page_4kb_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->enable_poison_page_4kb = val;
+
+    return 0;
+}
+
 static u64 mem_cgroup_enable_poison_page_read(struct cgroup_subsys_state *css,
         struct cftype *cft)
 {
@@ -4530,6 +4551,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.name = "enable_poison_page",
 		.read_u64 = mem_cgroup_enable_poison_page_read,
 		.write_u64 = mem_cgroup_enable_poison_page_write,
+	},
+    {
+		.name = "enable_poison_page_4kb",
+		.read_u64 = mem_cgroup_enable_poison_page_4kb_read,
+		.write_u64 = mem_cgroup_enable_poison_page_4kb_write,
 	},
     {
 		.name = "enable_split_page",
@@ -7068,13 +7094,32 @@ resume_kstaled_work:
         int read_num_accesses = atomic_read(&page->num_accesses);
         if(read_num_accesses < memcg->hot_small_page_threshold) {
             memcg->num_cold_small_bytes_kstaled += 4096;
+
+            /* If policy is to be run at 4KB pages only and page is detected as
+             * cold, then poison the page. */
+            if (memcg->enable_poison_page_4kb
+                    && !(PageTransHuge(page) || is_page_hugetmpfs)) {
+                page->is_page_cold = true;
+                page_poison(page, is_locked, NULL, true);
+            }
+
             /*
              * Compute the number of huge cold pages.
              */
             if(PageTransHuge(page) || is_page_hugetmpfs) {
                 memcg->num_cold_huge_bytes_kstaled += 2097152;
             }
+        } else {
+
+            /* If policy is to be run at 4KB pages only and page is detected as
+             * hot, then unpoison the page. */
+            if (memcg->enable_poison_page_4kb
+                    && !(PageTransHuge(page) || is_page_hugetmpfs)) {
+                page->is_page_cold = false;
+                page_poison(page, is_locked, NULL, false);
+            }
         }
+
         atomic_set(&page->num_accesses, 0);
     }
 

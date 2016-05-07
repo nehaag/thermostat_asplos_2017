@@ -1014,12 +1014,15 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
             }
         } else {
             referenced = __check_pte_and_set_pra(page, vma, address, pte, pra);
+//            if (referenced)
+//                atomic_inc(&page->num_accesses);
             __update_pra_with_referenced(pra, vma, referenced);
         }
     } else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
 		if (!(pra->pr_flags & PR_FOR_KSTALED)) {
 			if (pmdp_clear_flush_young_notify(vma, address, pmd)) {
 				referenced = 1;
+//                atomic_inc(&page->num_accesses);
 				clear_page_idle(page);
 			}
             __update_pra_with_referenced(pra, vma, referenced);
@@ -1030,6 +1033,7 @@ static int page_referenced_one(struct page *page, struct vm_area_struct *vma,
                 /* Do not increment num_accesses here since in this case page is
                  * not being sampled.
                  */
+//                atomic_inc(&page->num_accesses);
 			}
             __update_pra_with_referenced(pra, vma, referenced);
 		}

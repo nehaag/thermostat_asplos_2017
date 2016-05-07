@@ -292,6 +292,8 @@ struct mem_cgroup {
 
 #ifdef CONFIG_POISON_PAGE
     unsigned int enable_poison_page;
+    unsigned int enable_poison_page_4kb;
+    unsigned int enable_poison_page_2mb;
     atomic64_t cold_fault_time;
     atomic64_t total_cold_faults;
     unsigned int enable_split_page;
