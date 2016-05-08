@@ -300,6 +300,7 @@ struct mem_cgroup {
     unsigned int poison_sampling_ratio;
     unsigned int poison_sampling_period;
     unsigned int page_access_distribution[513];
+    unsigned int accummulated_page_access_distribution[513];
     unsigned int page_access_cummulative_distribution[513];
     unsigned int slow_memory_latency_ns;
     int hot_small_page_threshold;

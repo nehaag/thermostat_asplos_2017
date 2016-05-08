@@ -3911,6 +3911,13 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     }
     seq_printf(sf, "\n");
 
+    /* Print page access distribution */
+    seq_printf(sf, "accummulated_page_access_distribution ");
+    for (bucket = 0; bucket < 513; bucket++) {
+        seq_printf(sf, "%u ", memcg->accummulated_page_access_distribution[bucket]);
+    }
+    seq_printf(sf, "\n");
+
     seq_printf(sf, "num_hot_page_threshold_adaptive %d\n",
             memcg->num_hot_page_threshold_adaptive);
     seq_printf(sf, "num_cold_page_threshold_adaptive %d\n",
@@ -4004,6 +4011,7 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
 
     memcg->enable_poison_page = val;
     memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
+    memset(memcg->accummulated_page_access_distribution, 0, 513 * sizeof(unsigned int));
     memset(memcg->page_access_cummulative_distribution, 0,
             513 * sizeof(unsigned int));
     memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
@@ -6937,6 +6945,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * were found in each sampled huge page.
                  */
                 memcg->page_access_distribution[num_hot_small_pages]++;
+                memcg->accummulated_page_access_distribution[num_hot_small_pages]++;
 
                 /*
                  * Tag huge page as cold/hot or if huge page is a hotspot page,
