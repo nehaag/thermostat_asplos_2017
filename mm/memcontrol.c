@@ -3993,6 +3993,28 @@ static int mem_cgroup_enable_poison_page_4kb_write(struct cgroup_subsys_state *c
     return 0;
 }
 
+static u64 mem_cgroup_enable_poison_page_2mb_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->enable_poison_page_2mb;
+}
+
+static int mem_cgroup_enable_poison_page_2mb_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, u64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->enable_poison_page_2mb = val;
+
+    return 0;
+}
+
+
 static u64 mem_cgroup_enable_poison_page_read(struct cgroup_subsys_state *css,
         struct cftype *cft)
 {
@@ -4564,6 +4586,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.name = "enable_poison_page_4kb",
 		.read_u64 = mem_cgroup_enable_poison_page_4kb_read,
 		.write_u64 = mem_cgroup_enable_poison_page_4kb_write,
+	},
+    {
+		.name = "enable_poison_page_2mb",
+		.read_u64 = mem_cgroup_enable_poison_page_2mb_read,
+		.write_u64 = mem_cgroup_enable_poison_page_2mb_write,
 	},
     {
 		.name = "enable_split_page",
@@ -7117,6 +7144,10 @@ resume_kstaled_work:
              */
             if(PageTransHuge(page) || is_page_hugetmpfs) {
                 memcg->num_cold_huge_bytes_kstaled += 2097152;
+                if (memcg->enable_poison_page_2mb) {
+                    page->is_page_cold = true;
+                    page_poison(page, is_locked, NULL, true);
+                }
             }
         } else {
 
@@ -7124,6 +7155,10 @@ resume_kstaled_work:
              * hot, then unpoison the page. */
             if (memcg->enable_poison_page_4kb
                     && !(PageTransHuge(page) || is_page_hugetmpfs)) {
+                page->is_page_cold = false;
+                page_poison(page, is_locked, NULL, false);
+            } else if (memcg->enable_poison_page_2mb
+                    && (PageTransHuge(page) || is_page_hugetmpfs)) {
                 page->is_page_cold = false;
                 page_poison(page, is_locked, NULL, false);
             }

@@ -3182,6 +3182,41 @@ static int do_shared_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 }
 
 #ifdef CONFIG_POISON_PAGE
+/* simple loop based delay: */
+static void delay_loop(unsigned long loops)
+{
+        asm volatile(
+                "       test %0,%0      \n"
+                "       jz 3f           \n"
+                "       jmp 1f          \n"
+
+                ".align 16              \n"
+                "1:     jmp 2f          \n"
+
+                ".align 16              \n"
+                "2:     dec %0          \n"
+                "       jnz 2b          \n"
+                "3:     dec %0          \n"
+
+                : /* we don't need output */
+                :"a" (loops)
+        );
+}
+
+static void __const_udelay_poison(unsigned long xloops)
+{
+        int d0;
+
+        xloops *= 4;
+        asm("mull %%edx"
+                :"=d" (xloops), "=&a" (d0)
+                :"1" (xloops), ""
+                (this_cpu_read(cpu_info.loops_per_jiffy) * (HZ/4)));
+        
+        trace_printk("introducing fault: %lu\n", xloops);
+        delay_loop(++xloops);
+}
+
 /*
  * This function handles the fake page fault introduced to perform TLB miss
  * studies. We can perform our work in this fuction on the page table entries.
@@ -3239,7 +3274,9 @@ out:
 
     /* Introduce the slow memory delay for cold pages */
     if (page_struct && page_struct->is_page_cold) {
-        //        ndelay(mem_cgroup_slow_memory_latency_ns(memcg));
+//        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
+//        delay_loop(20);
+//        __const_udelay_poison(50000 * 0x00005);
         mem_cgroup_inc_num_badgerTrap_faults(memcg, false);
     }
 
@@ -3629,6 +3666,10 @@ out:
     spin_unlock(ptl);
 
     if (page_table && page_struct->is_page_cold) {
+//        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
+//        delay_loop(20);
+//        __const_udelay_poison(50000 * 0x00005);
+//        __const_udelay_poison(50000 * 0x000010c7);
         mem_cgroup_inc_num_badgerTrap_faults(memcg, true);
     }
 
