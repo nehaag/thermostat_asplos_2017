@@ -4120,7 +4120,7 @@ static int mem_cgroup_poison_sampling_ratio_write(struct cgroup_subsys_state *cs
     return 0;
 }
 
-static u64 mem_cgroup_poison_sampling_period_read(struct cgroup_subsys_state *css,
+static s64 mem_cgroup_poison_sampling_period_read(struct cgroup_subsys_state *css,
         struct cftype *cft)
 {
     struct mem_cgroup *memcg = mem_cgroup_from_css(css);
@@ -4129,7 +4129,7 @@ static u64 mem_cgroup_poison_sampling_period_read(struct cgroup_subsys_state *cs
 }
 
 static int mem_cgroup_poison_sampling_period_write(struct cgroup_subsys_state *css,
-        struct cftype *cft, u64 val)
+        struct cftype *cft, s64 val)
 {
     struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
@@ -4137,6 +4137,48 @@ static int mem_cgroup_poison_sampling_period_write(struct cgroup_subsys_state *c
         return -EINVAL;
 
     memcg->poison_sampling_period = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_profile_period_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->profile_period;
+}
+
+static int mem_cgroup_profile_period_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0 || val > 100)
+        return -EINVAL;
+
+    memcg->profile_period = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_profile_fraction_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->profile_fraction;
+}
+
+static int mem_cgroup_profile_fraction_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0 || val > 100)
+        return -EINVAL;
+
+    memcg->profile_fraction = val;
 
     return 0;
 }
@@ -4604,8 +4646,18 @@ static struct cftype mem_cgroup_legacy_files[] = {
 	},
     {
 		.name = "poison_sampling_period",
-		.read_u64 = mem_cgroup_poison_sampling_period_read,
-		.write_u64 = mem_cgroup_poison_sampling_period_write,
+		.read_s64 = mem_cgroup_poison_sampling_period_read,
+		.write_s64 = mem_cgroup_poison_sampling_period_write,
+	},
+    {
+		.name = "profile_period",
+		.read_s64 = mem_cgroup_profile_period_read,
+		.write_s64 = mem_cgroup_profile_period_write,
+	},
+    {
+		.name = "profile_fraction",
+		.read_s64 = mem_cgroup_profile_fraction_read,
+		.write_s64 = mem_cgroup_profile_fraction_write,
 	},
     {
 		.name = "slow_memory_latency_ns",
@@ -6806,7 +6858,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
     if (!page->mem_cgroup || is_page_smalltmpfs)
         goto resume_kstaled_work;
     //    lock_page_cgroup(pc);
-    unsigned int start_new_sampling_period = 0;
+    int start_new_sampling_period = 0;
     unsigned int offset = 0;
 
 
@@ -6903,219 +6955,289 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
         }
 
         /*
-         * Sample the pages to be splitted. Split a random number of pages
-         * (based on sampling ratio) for a given sample period.
-         * poison_sampling_period = 0 means we are sampling new pages every
-         * kstaled scan period.
-         * start_new_sampling_period = 1 means we are in the sampling phase to
-         * choose new set of pages to split.
-         */
-        if (memcg->poison_sampling_period == 0) {
-            start_new_sampling_period = 1;
-        } else {
-            start_new_sampling_period = !(memcg->idle_page_scans %
-                    memcg->poison_sampling_period);
-        }
-
-        /*
-         * Before sampling new set of pages for this sampling period, tag pages
-         * as cold, hot, or hotspot according to the num_accesses collected in
-         * the *previous* sampling period.
-         * Heuristics to decide whether page is cold or hot or hotspot:
-         * TODO
-         */
-        if (start_new_sampling_period) {
-            /*
-             * Find out if the page has been sampled in the *previous* sampling
-             * period.
-             */
-            if (page->in_sampling_state && page->is_page_split) {
-
-                /*
-                 * We have only sampled huge pages. Suddenly they should not
-                 * have become non-huge pages.
-                 */
-                WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
-
-                /*
-                 * Reset the page to not be in sampling state. We will sample
-                 * new set of pages below.
-                 */
-                page->in_sampling_state = 0;
-
-                /*
-                 * Count the number of hot small pages in this 2MB page. Hot is
-                 * defined as num_accesses >= hot_small_page_threshold over the
-                 * entire sampling period.
-                 */
-                int num_hot_small_pages = 0;
-                for (offset = 0; offset < 512; offset++) {
-                    struct page *small_page = page + offset;
-                    int read_num_accesses = atomic_read(&small_page->num_accesses);
-                    if (read_num_accesses >= memcg->hot_small_page_threshold) {
-                        num_hot_small_pages++;
-                    }
-
-                    /*
-                     * Update the num_access_distribution histogram in the memcg
-                     * with the number of accesses of this small page. The
-                     * histogram is clipped at 49 accesses.
-                     */
-                    int bin_number = read_num_accesses;
-                    if (bin_number >= 49)
-                        bin_number = 49;
-                    memcg->num_access_distribution[bin_number]++;
-                }
-
-                /*
-                 * We also maintain a distribution of how many hot small pages
-                 * were found in each sampled huge page.
-                 */
-                memcg->page_access_distribution[num_hot_small_pages]++;
-                memcg->accummulated_page_access_distribution[num_hot_small_pages]++;
-
-                /*
-                 * Tag huge page as cold/hot or if huge page is a hotspot page,
-                 * tag small pages inside it as cold/hot.
-                 */
-                if (num_hot_small_pages == 512 ||
-                        (num_hot_small_pages >
-                         memcg->num_hot_page_threshold_adaptive)) {
-                    /* This huge page is HOT, so we should collapse it. */
-                    page->in_sampling_state = 0;
-                    page->is_page_cold = false;
-                    page_collapse_to_huge(page, is_locked, false);
-                    memcg->num_collapse_failed_hot += page->is_page_split
-                                                        ? 1 : 0;
-
-                    bool found_atleast_one_cold_page = false;
-                    for (offset = 0; offset < 512; offset++) {
-                        struct page *small_page = page + offset;
-                        if (small_page->is_page_cold)
-                            found_atleast_one_cold_page = true;
-                        small_page->is_page_cold = false;
-                        atomic_set(&small_page->num_accesses, 0);
-                    }
-
-                    if (found_atleast_one_cold_page)
-                        memcg->num_migration_bytes += 2097152;
-                } else if(num_hot_small_pages <=
-                        memcg->num_cold_page_threshold_adaptive) {
-                    /*
-                     * This huge page is COLD, collapse this as well. Also
-                     * poison it so that accesses to this page are slowed down
-                     * by badgertrap.
-                     */
-                    page->is_page_cold = true;
-                    page->in_sampling_state = 0;
-                    page_collapse_to_huge(page, is_locked, true);
-                    memcg->num_collapse_failed_cold += page->is_page_split
-                                                        ? 1 : 0;
-
-                    bool found_atleast_one_hot_page = false;
-                    for (offset = 0; offset < 512; offset++) {
-                        struct page *small_page = page + offset;
-                        if (!small_page->is_page_cold)
-                            found_atleast_one_hot_page = true;
-                        small_page->is_page_cold = true;
-                        atomic_set(&small_page->num_accesses, 0);
-                    }
-
-                    if (found_atleast_one_hot_page)
-                        memcg->num_migration_bytes += 2097152;
-                } else {
-                    /*
-                     * This huge page is hotspot. Since the huge page PMD is
-                     * already split, we don't need to do any further splitting.
-                     * Tag the small pages as hot or cold based on if its
-                     * num_accesses is > or <= hotspot_hot_page_threshold.
-                     * Also poison the "cold" small pages so that accesses to
-                     * this page are slowed down by badgertrap.
-                     */
-                    for (offset = 0; offset < 512; offset++) {
-                        struct page *small_page = page + offset;
-                        small_page->in_sampling_state = 0;
-                        int read_num_accesses = atomic_read(&small_page->num_accesses);
-
-                        if (read_num_accesses < memcg->hotspot_hot_page_threshold) {
-                            /* poison this small page */
-                            page_poison(small_page, is_locked, NULL, true);
-                            if (!small_page->is_page_cold)
-                                memcg->num_migration_bytes += 4096;
-                            small_page->is_page_cold = true;
-                            atomic_set(&small_page->num_accesses, 0);
-                        } else {
-                            if (small_page->is_page_cold)
-                                memcg->num_migration_bytes += 4096;
-                            small_page->is_page_cold = false;
-                            atomic_set(&small_page->num_accesses, 0);
-                        }
-                    }
-                }
-            }
-        }
-
-        /*
          * Generate a random number between 0 and 100 which will be used to
          * decide whether this page is sampled in this sampling period or not.
+         * Alternatively, we will use to determine whether this page will be
+         * profiled or not in a particular profiling period.
          */
         unsigned int random_number;
         get_random_bytes(&random_number, sizeof(int));
         random_number %= 100;
 
+
         /*
-         * Sample the new set of huge pages for this sampling period, and split
-         * the PMDs for those huge pages.
+         * There are two parts of the hot/cold page classification process.
+         * First: determine what fraction of pages should be put into slow
+         * memory to meet the target performance (slowdown in our case).
+         * Second: rank pages into hot/cold to meet the target fraction of pages
+         * to be placed into slow memory. This can be done with either current
+         * policy based number of hot small (4KB) pages within a 2MB page or
+         * with any other ranking policy based on some kind of logistic
+         * regression or kind.
+         *
+         * For first part: we need access rate to pages in memory both in DRAM
+         * and slow memory to determine the fraction of pages to be shoved to
+         * slow memory. Since we do not have hardware support to get number of
+         * accesses to each page in memory we use badgerTrap and a profiling
+         * technique. Since, pages will be poisoned to determine memory access
+         * rate there will be profiling slowdown. We will need to keep to <1% so
+         * that we do not eat into total slowdown budget. Hence, we will profile
+         * only a fraction of pages and less frequently than current
+         * sampling/splitting frequency. During profiling phase no
+         * splitting/policy decisions (ranking) will be made. Hence, profiling
+         * and ranking will be mutually exclusive events.
          */
-        if (start_new_sampling_period) {
-            /*
-             * Sample this page if:
-             * a) the random_number is < sampling_ratio (we are sampling
-             * sampling_ratio percentage of huge pages),
-             * b) it is anonymous,
-             * c) it is a transparent huge page,
-             * d) it is not a HugeTLBFS page (determined by !PageHuge(page)),
-             * e) it is not the zero page.
+
+        int start_new_profile_period =
+            !(memcg->num_poison_sampling_periods % memcg->profile_period);
+
+        if (start_new_profile_period) {
+            /* Only poisoning of pages, no splitting. */
+            WARN_ON(page->in_sampling_state);
+
+            int profile_period_number =
+                memcg->idle_page_scans % memcg->poison_sampling_period;
+
+            if (profile_period_number == 0) {
+                /* Poison a fraction of pages. */
+                if ((random_number < memcg->profile_fraction)
+                        && !page->is_page_cold) {
+                    page->in_profiling_state = true;
+                    page_poison(page, is_locked, NULL, true);
+                }
+            } else if (profile_period_number ==
+                    (memcg->poison_sampling_period - 1)) {
+                /* Un-poison the page of it was poisoned for profiling. */
+                if (page->in_profiling_state) {
+                    page->in_profiling_state = false;
+                    if (!page->is_page_cold)
+                        page_poison(page, is_locked, NULL, false);
+                } /* else page is in slow memory, should not un-poison it. */
+            }
+        } else {
+
+#if 0
+
+            /* Second part: ranking of pages. Currently implemented via
+             * sampling/splitting. Ranking is based on number of hot small (4KB)
+             * pages within a 2MB page.
              */
-            if (memcg && random_number < memcg->poison_sampling_ratio
-//                    && PageAnon(page)
-                    && (PageTransHuge(page) || is_page_hugetmpfs)
-                    && !PageHuge(page)
-                    && !is_huge_zero_page(page)) {
 
-                if (page->is_page_split) {
-                    page->in_sampling_state = 1;
-                } else {
+            /*
+             * Sample the pages to be splitted. Split a random number of pages
+             * (based on sampling ratio) for a given sample period.
+             * poison_sampling_period = 0 means we are sampling new pages every
+             * kstaled scan period.
+             * start_new_sampling_period = 1 means we are in the sampling phase
+             * to choose new set of pages to split.
+             */
+            if (memcg->poison_sampling_period == 0) {
+                start_new_sampling_period = 1;
+            } else {
+                start_new_sampling_period = !(memcg->idle_page_scans %
+                        memcg->poison_sampling_period);
+            }
+
+
+            /*
+             * Before sampling new set of pages for this sampling period, tag
+             * pages as cold, hot, or hotspot according to the num_accesses
+             * collected in the *previous* sampling period.  Heuristics to
+             * decide whether page is cold or hot or hotspot: TODO
+             */
+            if (start_new_sampling_period) {
+                /*
+                 * Find out if the page has been sampled in the *previous*
+                 * sampling period.
+                 */
+                if (page->in_sampling_state && page->is_page_split) {
+
                     /*
-                     * Split the huge page PMD, but not the struct page. This is
-                     * done to simplify race conditions with VM page accounting and
-                     * simplify reference count mechanism.
+                     * We have only sampled huge pages. Suddenly they should not
+                     * have become non-huge pages.
                      */
-                    int split_successful = page_split_for_sampling(page, is_locked);
+                    WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
 
-                    /* Set sampling bit in the page after checking that page has
-                     * been actually split. */
-                    if(split_successful) {
-                        page->in_sampling_state = 1;
+                    /*
+                     * Reset the page to not be in sampling state. We will
+                     * sample new set of pages below.
+                     */
+                    page->in_sampling_state = 0;
+
+                    /*
+                     * Count the number of hot small pages in this 2MB page. Hot
+                     * is defined as num_accesses >= hot_small_page_threshold
+                     * over the entire sampling period.
+                     */
+                    int num_hot_small_pages = 0;
+                    for (offset = 0; offset < 512; offset++) {
+                        struct page *small_page = page + offset;
+                        int read_num_accesses =
+                            atomic_read(&small_page->num_accesses);
+                        if (read_num_accesses >=
+                                memcg->hot_small_page_threshold) {
+                            num_hot_small_pages++;
+                        }
+
+                        /*
+                         * Update the num_access_distribution histogram in the
+                         * memcg with the number of accesses of this small page.
+                         * The histogram is clipped at 49 accesses.
+                         */
+                        int bin_number = read_num_accesses;
+                        if (bin_number >= 49)
+                            bin_number = 49;
+                        memcg->num_access_distribution[bin_number]++;
+                    }
+
+                    /*
+                     * We also maintain a distribution of how many hot small
+                     * pages were found in each sampled huge page.
+                     */
+                    memcg->page_access_distribution[num_hot_small_pages]++;
+                    memcg->accummulated_page_access_distribution[num_hot_small_pages]++;
+
+                    /*
+                     * Tag huge page as cold/hot or if huge page is a hotspot
+                     * page, tag small pages inside it as cold/hot.
+                     */
+                    if (num_hot_small_pages == 512 ||
+                            (num_hot_small_pages >
+                             memcg->num_hot_page_threshold_adaptive)) {
+                        /* This huge page is HOT, so we should collapse it. */
+                        page->in_sampling_state = 0;
+                        page->is_page_cold = false;
+                        page_collapse_to_huge(page, is_locked, false);
+                        memcg->num_collapse_failed_hot += page->is_page_split
+                            ? 1 : 0;
+
+                        bool found_atleast_one_cold_page = false;
+                        for (offset = 0; offset < 512; offset++) {
+                            struct page *small_page = page + offset;
+                            if (small_page->is_page_cold)
+                                found_atleast_one_cold_page = true;
+                            small_page->is_page_cold = false;
+                            atomic_set(&small_page->num_accesses, 0);
+                        }
+
+                        if (found_atleast_one_cold_page)
+                            memcg->num_migration_bytes += 2097152;
+                    } else if(num_hot_small_pages <=
+                            memcg->num_cold_page_threshold_adaptive) {
+                        /*
+                         * This huge page is COLD, collapse this as well. Also
+                         * poison it so that accesses to this page are slowed
+                         * down by badgertrap.
+                         */
+                        page->is_page_cold = true;
+                        page->in_sampling_state = 0;
+                        page_collapse_to_huge(page, is_locked, true);
+                        memcg->num_collapse_failed_cold += page->is_page_split
+                            ? 1 : 0;
+
+                        bool found_atleast_one_hot_page = false;
+                        for (offset = 0; offset < 512; offset++) {
+                            struct page *small_page = page + offset;
+                            if (!small_page->is_page_cold)
+                                found_atleast_one_hot_page = true;
+                            small_page->is_page_cold = true;
+                            atomic_set(&small_page->num_accesses, 0);
+                        }
+
+                        if (found_atleast_one_hot_page)
+                            memcg->num_migration_bytes += 2097152;
+                    } else {
+                        /*
+                         * This huge page is hotspot. Since the huge page PMD is
+                         * already split, we don't need to do any further
+                         * splitting.  Tag the small pages as hot or cold based
+                         * on if its num_accesses is > or <=
+                         * hotspot_hot_page_threshold.  Also poison the "cold"
+                         * small pages so that accesses to this page are slowed
+                         * down by badgertrap.
+                         */
+                        for (offset = 0; offset < 512; offset++) {
+                            struct page *small_page = page + offset;
+                            small_page->in_sampling_state = 0;
+                            int read_num_accesses =
+                                atomic_read(&small_page->num_accesses);
+
+                            if (read_num_accesses <
+                                    memcg->hotspot_hot_page_threshold) {
+                                /* poison this small page */
+                                page_poison(small_page, is_locked, NULL, true);
+                                if (!small_page->is_page_cold)
+                                    memcg->num_migration_bytes += 4096;
+                                small_page->is_page_cold = true;
+                                atomic_set(&small_page->num_accesses, 0);
+                            } else {
+                                if (small_page->is_page_cold)
+                                    memcg->num_migration_bytes += 4096;
+                                small_page->is_page_cold = false;
+                                atomic_set(&small_page->num_accesses, 0);
+                            }
+                        }
                     }
                 }
-            } else {
-                /* Reset smapling bit in the page. */
-                page->in_sampling_state = 0;
             }
 
             /*
-             * Reset number of accesses to the page to 0, since this is the
-             * beginning of a new sampling period. Also, reset for the small
-             * pages in this huge page as we want to record num_accesses to
-             * those small pages.
+             * Sample the new set of huge pages for this sampling period, and
+             * split the PMDs for those huge pages.
              */
-            atomic_set(&page->num_accesses, 0);
-            if (PageTransHuge(page) || is_page_hugetmpfs) {
-                for (offset = 0; offset < 512; offset++) {
-                    atomic_set(&page[offset].num_accesses, 0);
+            if (start_new_sampling_period) {
+                /*
+                 * Sample this page if:
+                 * a) the random_number is < sampling_ratio (we are sampling
+                 * sampling_ratio percentage of huge pages),
+                 * b) it is anonymous,
+                 * c) it is a transparent huge page,
+                 * d) it is not a HugeTLBFS page (determined by
+                 * !PageHuge(page)),
+                 * e) it is not the zero page.
+                 */
+                if (memcg && random_number < memcg->poison_sampling_ratio
+                        //                    && PageAnon(page)
+                        && (PageTransHuge(page) || is_page_hugetmpfs)
+                        && !PageHuge(page)
+                        && !is_huge_zero_page(page)) {
+
+                    if (page->is_page_split) {
+                        page->in_sampling_state = 1;
+                    } else {
+                        /*
+                         * Split the huge page PMD, but not the struct page.
+                         * This is done to simplify race conditions with VM page
+                         * accounting and simplify reference count mechanism.
+                         */
+                        int split_successful = page_split_for_sampling(
+                                                            page, is_locked);
+
+                        /* Set sampling bit in the page after checking that page
+                         * has been actually split. */
+                        if(split_successful) {
+                            page->in_sampling_state = 1;
+                        }
+                    }
+                } else {
+                    /* Reset smapling bit in the page. */
+                    page->in_sampling_state = 0;
+                }
+
+                /*
+                 * Reset number of accesses to the page to 0, since this is the
+                 * beginning of a new sampling period. Also, reset for the small
+                 * pages in this huge page as we want to record num_accesses to
+                 * those small pages.
+                 */
+                atomic_set(&page->num_accesses, 0);
+                if (PageTransHuge(page) || is_page_hugetmpfs) {
+                    for (offset = 0; offset < 512; offset++) {
+                        atomic_set(&page[offset].num_accesses, 0);
+                    }
                 }
             }
+#endif
         }
     }
 
@@ -7382,6 +7504,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 //    memcpy(memcg->access_corr_printed, 
 //            memcg->access_corr, 11 * 11 * sizeof(unsigned int));
 //    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
+
     /*
      * Cumulative page access distribution for approximating
      * num_hot_page_threshold. Assume we will serve (cold_memory_fraction)% of accesses
@@ -7393,6 +7516,9 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
      */
     if (memcg->poison_sampling_period == 0 ||
             ((memcg->idle_page_scans % memcg->poison_sampling_period) == 0)) {
+
+        memcg->num_poison_sampling_periods++;
+
         int offset;
         int access_fraction;
         memcg->page_access_cummulative_distribution[0] =

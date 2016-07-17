@@ -219,8 +219,10 @@ struct page {
 
 #ifdef CONFIG_POISON_PAGE
     unsigned int in_sampling_state;
+    bool in_profiling_state;
     bool is_page_cold;
     atomic_t num_accesses;
+    atomic_t num_slow_mem_accesses;
     bool is_page_split;
 #ifdef CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE
     bool is_page_selected_for_locality_analysis;

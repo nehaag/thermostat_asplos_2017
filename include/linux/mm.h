@@ -748,9 +748,11 @@ static inline void page_poison_reset(struct page *page)
 {
     page->in_sampling_state = 0;
 //    bitmap_clear(page->pages_accessed_4KB, 0, 512);
+    page->in_profiling_state = false;
     page->is_page_cold = false;
     page->is_page_split = false;
     atomic_set(&page->num_accesses, 0);
+    atomic_set(&page->num_slow_mem_accesses, 0);
 }
 #endif
 

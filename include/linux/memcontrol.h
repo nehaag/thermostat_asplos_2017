@@ -298,7 +298,11 @@ struct mem_cgroup {
     atomic64_t total_cold_faults;
     unsigned int enable_split_page;
     unsigned int poison_sampling_ratio;
-    unsigned int poison_sampling_period;
+    int poison_sampling_period;
+    int profile_period;
+    int profile_fraction;
+	unsigned long num_poison_sampling_periods;
+
     unsigned int page_access_distribution[513];
     unsigned int accummulated_page_access_distribution[513];
     unsigned int page_access_cummulative_distribution[513];

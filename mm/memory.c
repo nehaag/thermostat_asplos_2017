@@ -3278,6 +3278,7 @@ out:
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
         mem_cgroup_inc_num_badgerTrap_faults(memcg, false);
+        atomic_inc(&page_struct->num_slow_mem_accesses);
     }
 
 #ifdef CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE
@@ -3632,7 +3633,8 @@ int transparent_fake_fault(struct mm_struct *mm,
     *page_table = pmd_mkyoung(*page_table);
     *page_table = pmd_unreserve(*page_table);
 
-    if (page_struct && page_struct->is_page_cold) {
+    if (page_struct &&
+            (page_struct->is_page_cold || page_struct->in_profiling_state)) {
 
         /* Touch the page only if PRESENT bit is set in the PMD entry. Else
          * recursive fault occurs on the same address and it leads to a deadlock
@@ -3665,7 +3667,8 @@ int transparent_fake_fault(struct mm_struct *mm,
 out:
     spin_unlock(ptl);
 
-    if (page_table && page_struct->is_page_cold) {
+    if (page_table &&
+            (page_struct->is_page_cold || page_struct->in_profiling_state)) {
 //        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
