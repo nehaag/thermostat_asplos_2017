@@ -3898,6 +3898,11 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
             atomic64_read(&memcg->cold_fault_time));
     seq_printf(sf, "total_cold_faults %llu\n",
             atomic64_read(&memcg->total_cold_faults));
+    seq_printf(sf, "num_pages_profiled %d\n",
+            memcg->num_pages_profiled_printed);
+    seq_printf(sf, "num_pages_for_profiling %d\n",
+            memcg->num_pages_for_profiling_printed);
+
     /* Print page access distribution */
     seq_printf(sf, "num_access_distribution ");
     for (bucket = 0; bucket < 50; bucket++) {
@@ -4065,6 +4070,10 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     atomic64_set(&memcg->cold_fault_time, 0);
     atomic64_set(&memcg->total_cold_faults, 0);
     memcg->num_badgerTrap_faults_sampled_printed = 0;
+    memcg->num_pages_profiled = 0;
+    memcg->num_pages_profiled_printed = 0;
+    memcg->num_pages_for_profiling = 0;
+    memcg->num_pages_for_profiling_printed = 0;
     memcg->num_hot_page_threshold_adaptive = memcg->num_hot_page_threshold;
     memcg->num_cold_page_threshold_adaptive = memcg->num_cold_page_threshold;
     memcg->num_collapse_failed_hot = 0;
@@ -6754,6 +6763,7 @@ static void update_memory_access_rate(struct mem_cgroup* memcg, int num_slow_mem
         return;
     }
     memcg->memory_access_rates[memcg->memory_access_idx] = num_slow_mem_accesses;
+//    printk("slow acc[%d] = %d\n", memcg->memory_access_idx, memcg->memory_access_rates[memcg->memory_access_idx]);
     memcg->memory_access_idx++;
 }
 
@@ -7008,11 +7018,9 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
          */
 
         int start_new_profile_period =
-            !(memcg->num_poison_sampling_periods % memcg->profile_period);
+            (memcg->num_poison_sampling_periods % memcg->profile_period == 0);
 
         if (start_new_profile_period) {
-            /* Only poisoning of pages, no splitting. */
-            WARN_ON(page->in_sampling_state);
 
             int profile_period_number =
                 memcg->idle_page_scans % memcg->poison_sampling_period;
@@ -7020,14 +7028,26 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
             if (profile_period_number == 0) {
                 /* Poison a fraction of pages. */
                 if ((random_number < memcg->profile_fraction)
-                        && !page->is_page_cold) {
+                        && page_mapped(page)
+                        && !page->is_page_cold
+                        && (PageTransHuge(page) || is_page_hugetmpfs)
+                        && !PageHuge(page)
+                        && !is_huge_zero_page(page)) {
                     page->in_profiling_state = true;
                     page_poison(page, is_locked, NULL, true);
+                    memcg->num_pages_profiled++;
                 }
                 /* Reset the location where to write the next sampled memory
                  * access.
                  */
                 memcg->memory_access_idx = 0;
+                if (!page->is_page_cold
+                        && page_mapped(page)
+                        && (PageTransHuge(page) || is_page_hugetmpfs)
+                        && !PageHuge(page)
+                        && !is_huge_zero_page(page)) {
+                    memcg->num_pages_for_profiling++;
+                }
             } else if (profile_period_number ==
                     (memcg->poison_sampling_period - 1)) {
                 /* Un-poison the page of it was poisoned for profiling. */
@@ -7035,12 +7055,17 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page->in_profiling_state = false;
                     if (!page->is_page_cold)
                         page_poison(page, is_locked, NULL, false);
+                    WARN_ON(page->is_page_cold);
+                    WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
                     update_memory_access_rate(memcg, atomic_read(&page->num_slow_mem_accesses));
+                    atomic_set(&page->num_slow_mem_accesses, 0);
                 } /* else page is in slow memory, should not un-poison it. */
+                memcg->num_pages_profiled = 0;
+                memcg->num_pages_for_profiling = 0;
             }
         } else {
 
-#if 0
+//#if 0
 
             /* Second part: ranking of pages. Currently implemented via
              * sampling/splitting. Ranking is based on number of hot small (4KB)
@@ -7261,7 +7286,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     }
                 }
             }
-#endif
+//#endif
         }
     }
 
@@ -7452,8 +7477,8 @@ abort:
 
 static int cmp_func(const void *a, const void *b)
 {
-    const int *val_a = a;
-    const int *val_b = b;
+    const int val_a = *(const int*)a;
+    const int val_b = *(const int*)b;
 
     if (val_a > val_b) return 1;
     if (val_a < val_b) return -1;
@@ -7530,6 +7555,10 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     memcg->num_badgerTrap_faults_sampled_printed = atomic_read(
             &memcg->num_badgerTrap_faults_sampled);
     atomic_set(&memcg->num_badgerTrap_faults_sampled, 0);
+    memcg->num_pages_profiled_printed = memcg->num_pages_profiled;
+    memcg->num_pages_profiled = 0;
+    memcg->num_pages_for_profiling_printed = memcg->num_pages_for_profiling;
+    memcg->num_pages_for_profiling = 0;
 
     memcpy(memcg->num_access_distribution_printed, 
             memcg->num_access_distribution, 50 * sizeof(unsigned int));
@@ -7559,8 +7588,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
          * accesses/sec.
          */
         int cold_memory_fraction = 0;
-        int i = 0;
         if (memcg->memory_access_rates) {
+            printk(KERN_WARNING "num rates: %d\n", memcg->memory_access_idx);
             sort(memcg->memory_access_rates, memcg->memory_access_idx, sizeof(int),
                     cmp_func, NULL);
 
@@ -7574,14 +7603,25 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
 
+            int i = 0;
             for (i = 0; i < memcg->memory_access_idx; i++) {
                 access_sum += memcg->memory_access_rates[i];
+//                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i]);
                 if (access_sum >= target_access_rate) {
                     cold_memory_fraction = (i*100) / memcg->memory_access_idx;
-                    printk("cold_memory_fraction:%d ", cold_memory_fraction);
+                    atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
+                    printk("target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d\n", target_access_rate, cold_memory_fraction,access_sum, memcg->memory_access_idx);
                     break;
                 }
             }
+
+            for (i += 1; i < memcg->memory_access_idx; i++) {
+                access_sum += memcg->memory_access_rates[i];
+                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i]);
+            }
+            printk("total_access+_sum:%d\n", access_sum);
+            // TODO: check if this is needed?:w
+            memcg->memory_access_idx = 0;
         }
 
         int offset;
@@ -7601,7 +7641,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                 / (memcg->page_access_cummulative_distribution[512]
                         + 1);
 //            if (access_fraction >= memcg->cold_memory_fraction) {
-            if (access_fraction >= cold_memory_fraction) {
+            if (access_fraction >= atomic_read(&memcg->cold_memory_fraction_atomic)) {
+                printk("cold_memory_fraction:%d,access_fraction:%d,offset:%d\n", atomic_read(&memcg->cold_memory_fraction_atomic), access_fraction, offset);
                 memcg->num_hot_page_threshold_adaptive = offset;
                 memcg->num_cold_page_threshold_adaptive = offset;
                 break;
@@ -7616,7 +7657,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                         + 1);
  
             if (access_fraction >=
-                 cold_memory_fraction + memcg->hotspot_memory_fraction) {
+                 atomic_read(&memcg->cold_memory_fraction_atomic) + memcg->hotspot_memory_fraction) {
 //                 memcg->cold_memory_fraction + memcg->hotspot_memory_fraction) {
                 memcg->num_hot_page_threshold_adaptive = offset;
                 break;

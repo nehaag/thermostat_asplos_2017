@@ -3252,7 +3252,8 @@ int do_fake_page_fault(struct mm_struct *mm, struct vm_area_struct *vma,
     *page_table = pte_mkyoung(*page_table);
     *page_table = pte_unreserve(*page_table);
 
-    if (page_struct && page_struct->is_page_cold) {
+    if (page_struct &&
+           (page_struct->is_page_cold || page_struct->in_profiling_state)) {
 
         /* Touch the page to bring the PTE to TLB */
         touch_page_addr = (void *)(address & PAGE_MASK);
@@ -3273,7 +3274,8 @@ out:
     pte_unmap_unlock(page_table, ptl);
 
     /* Introduce the slow memory delay for cold pages */
-    if (page_struct && page_struct->is_page_cold) {
+    if (page_struct &&
+            (page_struct->is_page_cold || page_struct->in_profiling_state)) {
 //        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
@@ -3674,6 +3676,7 @@ out:
 //        __const_udelay_poison(50000 * 0x00005);
 //        __const_udelay_poison(50000 * 0x000010c7);
         mem_cgroup_inc_num_badgerTrap_faults(memcg, true);
+        atomic_inc(&page_struct->num_slow_mem_accesses);
     }
 
     return 0;

@@ -316,6 +316,7 @@ struct mem_cgroup {
     int num_hot_page_threshold_adaptive;
     int num_cold_page_threshold_adaptive;
     int cold_memory_fraction;
+    int cold_memory_fraction_atomic;
     int hotspot_memory_fraction;
     int num_collapse_failed_hot;
     int num_collapse_failed_cold;
@@ -371,6 +372,10 @@ struct mem_cgroup {
     int num_badgerTrap_huge_faults_cold_printed;
     atomic_t num_badgerTrap_faults_sampled;
     int num_badgerTrap_faults_sampled_printed;
+    unsigned int num_pages_profiled;
+    unsigned int num_pages_profiled_printed;
+    unsigned int num_pages_for_profiling;
+    unsigned int num_pages_for_profiling_printed;
 //    unsigned int access_corr[11][11];
 //    unsigned int access_corr_printed[11][11];
 #endif
