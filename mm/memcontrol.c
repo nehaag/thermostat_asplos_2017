@@ -419,12 +419,19 @@ int mem_cgroup_hot_page_threshold(struct mem_cgroup *memcg)
 }
 
 void mem_cgroup_inc_num_badgerTrap_faults(struct mem_cgroup *memcg,
-        bool is_huge)
+        bool is_huge, bool is_profiled_page)
 {
-    if (is_huge)
-        atomic_inc(&memcg->num_badgerTrap_huge_faults_cold);
-    else
-        atomic_inc(&memcg->num_badgerTrap_faults_cold);
+    if (is_huge) {
+        if (is_profiled_page)
+            atomic_inc(&memcg->num_badgerTrap_huge_faults_profile);
+        else
+            atomic_inc(&memcg->num_badgerTrap_huge_faults_cold);
+    } else {
+        if (is_profiled_page)
+            atomic_inc(&memcg->num_badgerTrap_faults_profile);
+        else
+            atomic_inc(&memcg->num_badgerTrap_faults_cold);
+    }
 }
 #endif /* CONFIG_POISON_PAGE */
 
@@ -3891,8 +3898,11 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
             memcg->num_badgerTrap_faults_cold_printed);
     seq_printf(sf, "num_badgerTrap_huge_faults_cold %d\n",
             memcg->num_badgerTrap_huge_faults_cold_printed);
-    seq_printf(sf, "num_badgerTrap_faults_sampled %d\n",
-            memcg->num_badgerTrap_faults_sampled_printed);
+
+    seq_printf(sf, "num_badgerTrap_faults_profile %d\n",
+            memcg->num_badgerTrap_faults_profile_printed);
+    seq_printf(sf, "num_badgerTrap_huge_faults_profile %d\n",
+            memcg->num_badgerTrap_huge_faults_profile_printed);
 
     seq_printf(sf, "cold_fault_time %llu\n",
             atomic64_read(&memcg->cold_fault_time));
@@ -4062,14 +4072,19 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_mapped_bytes_printed = 0;
     memcg->num_small_file_allocated_bytes = 0;
     memcg->num_small_file_allocated_bytes_printed = 0;
+
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
     memcg->num_badgerTrap_faults_cold_printed = 0;
     atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
     memcg->num_badgerTrap_huge_faults_cold_printed = 0;
-    atomic_set(&memcg->num_badgerTrap_faults_sampled, 0);
+
+    atomic_set(&memcg->num_badgerTrap_faults_profile, 0);
+    memcg->num_badgerTrap_faults_profile_printed = 0;
+    atomic_set(&memcg->num_badgerTrap_huge_faults_profile, 0);
+    memcg->num_badgerTrap_huge_faults_profile_printed = 0;
+
     atomic64_set(&memcg->cold_fault_time, 0);
     atomic64_set(&memcg->total_cold_faults, 0);
-    memcg->num_badgerTrap_faults_sampled_printed = 0;
     memcg->num_pages_profiled = 0;
     memcg->num_pages_profiled_printed = 0;
     memcg->num_pages_for_profiling = 0;
@@ -4164,10 +4179,31 @@ static int mem_cgroup_profile_period_write(struct cgroup_subsys_state *css,
 {
     struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 
-    if (val < 0 || val > 100)
+    if (val < 0)
         return -EINVAL;
 
     memcg->profile_period = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_warmup_scan_periods_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->warmup_scan_periods;
+}
+
+static int mem_cgroup_warmup_scan_periods_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->warmup_scan_periods = val;
 
     return 0;
 }
@@ -4663,6 +4699,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.name = "profile_period",
 		.read_s64 = mem_cgroup_profile_period_read,
 		.write_s64 = mem_cgroup_profile_period_write,
+	},
+    {
+		.name = "warmup_scan_periods",
+		.read_s64 = mem_cgroup_warmup_scan_periods_read,
+		.write_s64 = mem_cgroup_warmup_scan_periods_write,
 	},
     {
 		.name = "profile_fraction",
@@ -7020,7 +7061,8 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
         int start_new_profile_period =
             (memcg->num_poison_sampling_periods % memcg->profile_period == 0);
 
-        if (start_new_profile_period) {
+        if ((memcg->idle_page_scans > memcg->warmup_scan_periods)
+                && start_new_profile_period) {
 
             int profile_period_number =
                 memcg->idle_page_scans % memcg->poison_sampling_period;
@@ -7063,7 +7105,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                 memcg->num_pages_profiled = 0;
                 memcg->num_pages_for_profiling = 0;
             }
-        } else {
+        } else if (memcg->idle_page_scans > memcg->warmup_scan_periods) {
 
 //#if 0
 
@@ -7546,15 +7588,21 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
     memcg->num_small_file_allocated_bytes_printed =
         memcg->num_small_file_allocated_bytes;
     memcg->num_small_file_allocated_bytes = 0;
+
     memcg->num_badgerTrap_faults_cold_printed = atomic_read(
             &memcg->num_badgerTrap_faults_cold);
     atomic_set(&memcg->num_badgerTrap_faults_cold, 0);
     memcg->num_badgerTrap_huge_faults_cold_printed = atomic_read(
             &memcg->num_badgerTrap_huge_faults_cold);
     atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
-    memcg->num_badgerTrap_faults_sampled_printed = atomic_read(
-            &memcg->num_badgerTrap_faults_sampled);
-    atomic_set(&memcg->num_badgerTrap_faults_sampled, 0);
+
+    memcg->num_badgerTrap_faults_profile_printed = atomic_read(
+            &memcg->num_badgerTrap_faults_profile);
+    atomic_set(&memcg->num_badgerTrap_faults_profile, 0);
+    memcg->num_badgerTrap_huge_faults_profile_printed = atomic_read(
+            &memcg->num_badgerTrap_huge_faults_profile);
+    atomic_set(&memcg->num_badgerTrap_huge_faults_profile, 0);
+
     memcg->num_pages_profiled_printed = memcg->num_pages_profiled;
     memcg->num_pages_profiled = 0;
     memcg->num_pages_for_profiling_printed = memcg->num_pages_for_profiling;

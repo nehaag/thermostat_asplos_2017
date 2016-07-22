@@ -302,6 +302,7 @@ struct mem_cgroup {
     int profile_period;
     int profile_fraction;
 	unsigned long num_poison_sampling_periods;
+    int warmup_scan_periods;
 
     unsigned int page_access_distribution[513];
     unsigned int accummulated_page_access_distribution[513];
@@ -366,12 +367,17 @@ struct mem_cgroup {
     unsigned long num_small_file_allocated_bytes_printed;
     unsigned int num_access_distribution[50];
     unsigned int num_access_distribution_printed[50];
+
     atomic_t num_badgerTrap_faults_cold;
     int num_badgerTrap_faults_cold_printed;
     atomic_t num_badgerTrap_huge_faults_cold;
     int num_badgerTrap_huge_faults_cold_printed;
-    atomic_t num_badgerTrap_faults_sampled;
-    int num_badgerTrap_faults_sampled_printed;
+
+    atomic_t num_badgerTrap_faults_profile;
+    int num_badgerTrap_faults_profile_printed;
+    atomic_t num_badgerTrap_huge_faults_profile;
+    int num_badgerTrap_huge_faults_profile_printed;
+
     unsigned int num_pages_profiled;
     unsigned int num_pages_profiled_printed;
     unsigned int num_pages_for_profiling;
@@ -439,7 +445,7 @@ extern unsigned int mem_cgroup_slow_memory_latency_ns(struct mem_cgroup *memcg);
 extern int mem_cgroup_cold_page_threshold(struct mem_cgroup *memcg);
 extern int mem_cgroup_hot_page_threshold(struct mem_cgroup *memcg);
 extern void mem_cgroup_inc_num_badgerTrap_faults(struct mem_cgroup *memcg,
-        bool is_cold);
+        bool is_cold, bool is_profiled_page);
 #endif /* CONFIG_POISON_PAGE */
 
 #define mem_cgroup_from_counter(counter, member)	\

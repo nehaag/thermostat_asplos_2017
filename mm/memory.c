@@ -3279,7 +3279,8 @@ out:
 //        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
-        mem_cgroup_inc_num_badgerTrap_faults(memcg, false);
+        mem_cgroup_inc_num_badgerTrap_faults(memcg, false,
+                page_struct->in_profiling_state);
         atomic_inc(&page_struct->num_slow_mem_accesses);
     }
 
@@ -3675,7 +3676,8 @@ out:
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
 //        __const_udelay_poison(50000 * 0x000010c7);
-        mem_cgroup_inc_num_badgerTrap_faults(memcg, true);
+        mem_cgroup_inc_num_badgerTrap_faults(memcg, true,
+                page_struct->in_profiling_state);
         atomic_inc(&page_struct->num_slow_mem_accesses);
     }
 
