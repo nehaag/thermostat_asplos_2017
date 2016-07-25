@@ -67,7 +67,6 @@
 #include <linux/tracehook.h>
 #include <linux/kthread.h>
 #include <linux/rmap.h>
-#include <linux/sort.h>
 #include <linux/vmalloc.h>
 #include "internal.h"
 #include <net/sock.h>
@@ -6790,20 +6789,26 @@ static void __update_memcg_hot_cold_bytes(struct page* page,
 }
 
 #define MAX_MEMORY_ACCESSES 32768
-
-static void update_memory_access_rate(struct mem_cgroup* memcg, int num_slow_mem_accesses) {
+static void update_memory_access_rate(struct mem_cgroup* memcg,
+        struct page *page_struct) {
     if (!(memcg->memory_access_rates)) {
-        memcg->memory_access_rates = kmalloc(MAX_MEMORY_ACCESSES * sizeof(int), GFP_KERNEL);
+        memcg->memory_access_rates = kmalloc(MAX_MEMORY_ACCESSES *
+                                        sizeof(struct page_access_rate),
+                                        GFP_KERNEL);
         memcg->memory_access_idx = 0;
     }
 
-    // Place the memory access at the correct position and increment the next
-    // position.
+    /* Place the memory access at the correct position and increment the next
+     * position.
+     */
     if (memcg->memory_access_idx == MAX_MEMORY_ACCESSES) {
         printk(KERN_WARNING "memory_access_rates buffer not large enough");
         return;
     }
-    memcg->memory_access_rates[memcg->memory_access_idx] = num_slow_mem_accesses;
+    memcg->memory_access_rates[memcg->memory_access_idx].access_rate =
+        atomic_read(&page_struct->num_slow_mem_accesses);
+    memcg->memory_access_rates[memcg->memory_access_idx].page_struct =
+        page_struct;
 //    printk("slow acc[%d] = %d\n", memcg->memory_access_idx, memcg->memory_access_rates[memcg->memory_access_idx]);
     memcg->memory_access_idx++;
 }
@@ -7099,7 +7104,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         page_poison(page, is_locked, NULL, false);
                     WARN_ON(page->is_page_cold);
                     WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
-                    update_memory_access_rate(memcg, atomic_read(&page->num_slow_mem_accesses));
+                    update_memory_access_rate(memcg, page);
                     atomic_set(&page->num_slow_mem_accesses, 0);
                 } /* else page is in slow memory, should not un-poison it. */
                 memcg->num_pages_profiled = 0;
@@ -7193,7 +7198,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                      * page, tag small pages inside it as cold/hot.
                      */
                     if (num_hot_small_pages == 512 ||
-                            (num_hot_small_pages >
+                            (num_hot_small_pages >=
                              memcg->num_hot_page_threshold_adaptive)) {
                         /* This huge page is HOT, so we should collapse it. */
                         page->in_sampling_state = 0;
@@ -7213,7 +7218,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                         if (found_atleast_one_cold_page)
                             memcg->num_migration_bytes += 2097152;
-                    } else if(num_hot_small_pages <=
+                    } else if(num_hot_small_pages <
                             memcg->num_cold_page_threshold_adaptive) {
                         /*
                          * This huge page is COLD, collapse this as well. Also
@@ -7517,13 +7522,13 @@ abort:
     return pfn >= node_end;
 }
 
-static int cmp_func(const void *a, const void *b)
+static int cmp_func_increasing(const void *a, const void *b)
 {
-    const int val_a = *(const int*)a;
-    const int val_b = *(const int*)b;
+    const struct page_access_rate val_a = *(const struct page_access_rate*)a;
+    const struct page_access_rate val_b = *(const struct page_access_rate*)b;
 
-    if (val_a > val_b) return 1;
-    if (val_a < val_b) return -1;
+    if (val_a.access_rate > val_b.access_rate) return 1;
+    if (val_a.access_rate < val_b.access_rate) return -1;
     return 0;
 }
 
@@ -7638,8 +7643,9 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
         int cold_memory_fraction = 0;
         if (memcg->memory_access_rates) {
             printk(KERN_WARNING "num rates: %d\n", memcg->memory_access_idx);
-            sort(memcg->memory_access_rates, memcg->memory_access_idx, sizeof(int),
-                    cmp_func, NULL);
+            sort(memcg->memory_access_rates, memcg->memory_access_idx,
+                    sizeof(struct page_access_rate),
+                    cmp_func_increasing, NULL);
 
             int access_sum = 0;
             /* Target access rate 30K accesses/sec has to be scaled with length
@@ -7653,8 +7659,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 
             int i = 0;
             for (i = 0; i < memcg->memory_access_idx; i++) {
-                access_sum += memcg->memory_access_rates[i];
-//                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i]);
+                access_sum += memcg->memory_access_rates[i].access_rate;
+//                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i].access_rate);
                 if (access_sum >= target_access_rate) {
                     cold_memory_fraction = (i*100) / memcg->memory_access_idx;
                     atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
@@ -7664,8 +7670,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             }
 
             for (i += 1; i < memcg->memory_access_idx; i++) {
-                access_sum += memcg->memory_access_rates[i];
-                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i]);
+                access_sum += memcg->memory_access_rates[i].access_rate;
+                printk("slow acc[%d] = %d\n", i, memcg->memory_access_rates[i].access_rate);
             }
             printk("total_access+_sum:%d\n", access_sum);
             // TODO: check if this is needed?:w

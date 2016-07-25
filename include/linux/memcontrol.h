@@ -172,6 +172,11 @@ enum memcg_kmem_state {
 	KMEM_ONLINE,
 };
 
+struct page_access_rate {
+    struct page *page_struct;
+    int access_rate;
+};
+
 /*
  * The memory controller data structure. The memory controller controls both
  * page cache and RSS per cgroup. We would eventually like to provide
@@ -307,7 +312,7 @@ struct mem_cgroup {
     unsigned int page_access_distribution[513];
     unsigned int accummulated_page_access_distribution[513];
     unsigned int page_access_cummulative_distribution[513];
-    int *memory_access_rates;
+    struct page_access_rate *memory_access_rates;
     int memory_access_idx;
     unsigned int slow_memory_latency_ns;
     int hot_small_page_threshold;
