@@ -322,7 +322,7 @@ struct mem_cgroup {
     int num_hot_page_threshold_adaptive;
     int num_cold_page_threshold_adaptive;
     int cold_memory_fraction;
-    int cold_memory_fraction_atomic;
+    atomic_t cold_memory_fraction_atomic;
     int hotspot_memory_fraction;
     int num_collapse_failed_hot;
     int num_collapse_failed_cold;

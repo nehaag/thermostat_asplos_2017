@@ -3841,7 +3841,7 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     unsigned int seqcount;
     struct idle_page_stats stats[NUM_KSTALED_BUCKETS];
     unsigned long scans;
-    int bucket, bucket2;
+    int bucket;
 
     do {
         seqcount = read_seqcount_begin(&memcg->idle_page_stats_lock);
@@ -3903,9 +3903,9 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_badgerTrap_huge_faults_profile %d\n",
             memcg->num_badgerTrap_huge_faults_profile_printed);
 
-    seq_printf(sf, "cold_fault_time %llu\n",
+    seq_printf(sf, "cold_fault_time %lu\n",
             atomic64_read(&memcg->cold_fault_time));
-    seq_printf(sf, "total_cold_faults %llu\n",
+    seq_printf(sf, "total_cold_faults %lu\n",
             atomic64_read(&memcg->total_cold_faults));
     seq_printf(sf, "num_pages_profiled %d\n",
             memcg->num_pages_profiled_printed);
@@ -3951,14 +3951,6 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_cold_small_bytes_kstaled %llu\n",
         memcg->num_cold_small_bytes_kstaled_printed);
 
-//    seq_printf(sf, "access_corr\n");
-//    for (bucket = 0; bucket < 11; bucket++) {
-//        for(bucket2 = 0; bucket2 < 11; bucket2++) {
-//            seq_printf(sf, "%u ", memcg->access_corr_printed[bucket][bucket2]);
-//        }
-//        seq_printf(sf, "\n");
-//    }
-//    seq_printf(sf, "\n");
 #endif /* CONFIG_POISON_PAGE */
 
     return 0;
@@ -6820,7 +6812,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
     bool is_locked = false;
     bool is_file;
     struct page_referenced_info info;
-    struct page_cgroup *pc;
+//    struct page_cgroup *pc;
     struct mem_cgroup *memcg = NULL;
     int age;
     struct idle_page_stats *stats;
@@ -7092,7 +7084,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 //                    page_collapse_to_huge(page, is_locked, true);
                     int offset = 0;
                     int num_4K_badgerTrapped = 0;
-                    while (num_4K_badgerTrapped <= 50 && offset <=512) {
+                    while (num_4K_badgerTrapped <= 50 && offset < 512) {
                         unsigned int page_offset;
                         get_random_bytes(&page_offset, sizeof(unsigned int));
                         page_offset %= 512;
@@ -7100,22 +7092,22 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         if (atomic_read(&small_page->num_accesses) > 0) {
                             page_poison(small_page, is_locked, NULL, true);
                             small_page->in_profiling_state = true; 
-                            atomic_set(&small_page->num_accesses, 0);
+//                            atomic_set(&small_page->num_accesses, 0);
                             num_4K_badgerTrapped++;
                         }
                         offset++;
                     }
 
-//                    /* For groundtruth remember num_accesses of all
-//                     * small pages in the previous period.
-//                     */
-//                    for (offset = 0; offset < 512; offset++) {
-//                        struct page *small_page = page + offset;
-//                        atomic_set(&small_page->num_accesses_previous_sampling_period,
-//                            atomic_read(&small_page->num_accesses));
-//                        atomic_set(&small_page->num_accesses, 0);
-//                        small_page->in_sampling_state = false;
-//                    }
+                    /* For groundtruth remember num_accesses of all
+                     * small pages in the previous period.
+                     */
+                    for (offset = 0; offset < 512; offset++) {
+                        struct page *small_page = page + offset;
+                        atomic_set(&small_page->num_accesses_previous_sampling_period,
+                            atomic_read(&small_page->num_accesses));
+                        atomic_set(&small_page->num_accesses, 0);
+                        small_page->in_sampling_state = false;
+                    }
 
                     memcg->num_pages_profiled++;
                 }
@@ -7140,20 +7132,28 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     page->in_profiling_state = false;
 
                     int page_offset = 0;
-//                    int slow_mem_accesses = 0;
+                    int num_pages_profiled = 0;
+                    int slow_mem_accesses = 0;
+                    int num_4K_accessed_prev_period = 0;
+
                     for (page_offset = 0; page_offset < 512; page_offset++) {
                         struct page *small_page = page + page_offset;
                         if (!small_page->is_page_cold && small_page->in_profiling_state) {
                             page_poison(small_page, is_locked, NULL, false);
                             small_page->in_profiling_state = false;
-//                            slow_mem_accesses += atomic_read(&small_page->num_slow_mem_accesses);
-                            printk("%d:%d ", page_offset, atomic_read(&small_page->num_slow_mem_accesses));
+                            slow_mem_accesses += atomic_read(&small_page->num_slow_mem_accesses);
                             atomic_set(&small_page->num_slow_mem_accesses, 0);
+                            num_pages_profiled++;
+                        }
+                        if (atomic_read(&small_page->num_accesses_previous_sampling_period)) {
+                            num_4K_accessed_prev_period++;
                         }
                     }
-                    printk("\n");
                     page_collapse_to_huge(page, is_locked, false);
-//                    update_memory_access_rate(memcg, page, slow_mem_accesses);
+
+                    if (num_pages_profiled)
+                        slow_mem_accesses = (slow_mem_accesses * num_4K_accessed_prev_period) / num_pages_profiled;
+                    update_memory_access_rate(memcg, page, slow_mem_accesses);
 //                    atomic_set(&page->num_slow_mem_accesses, 0);
                 } /* else page is in slow memory, should not un-poison it. */
                 memcg->num_pages_profiled = 0;
@@ -7702,7 +7702,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
              * of sampling period and fraction of pages we are profiling at a
              * given time.
              */
-            int target_access_rate = (30 * 1000)
+            int target_access_rate = (200 * 1000)
                                     * (memcg->poison_sampling_period - 1)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
