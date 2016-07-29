@@ -2151,6 +2151,10 @@ static int wp_page_copy(struct mm_struct *mm, struct vm_area_struct *vma,
 		page_add_new_anon_rmap(new_page, vma, address, false);
 		mem_cgroup_commit_charge(new_page, memcg, false, false);
 		lru_cache_add_active_or_unevictable(new_page, vma);
+#ifdef CONFIG_POISON_PAGE
+        if (is_pte_reserved(orig_pte))
+            entry = pte_mkreserve(entry);
+#endif
 		/*
 		 * We call the notify macro here because, when using secondary
 		 * mmu page tables (such as kvm shadow page tables), we want the
@@ -3279,6 +3283,7 @@ out:
 //        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
+
         mem_cgroup_inc_num_badgerTrap_faults(memcg, false,
                 page_struct->in_profiling_state);
         atomic_inc(&page_struct->num_slow_mem_accesses);
@@ -3543,6 +3548,7 @@ static int handle_pte_fault(struct mm_struct *mm, struct vm_area_struct *vma,
             ptl = pte_lockptr(mm,pmd);
             spin_lock(ptl);
             entry = *pte;
+            printk("COW 4K page\n");
             return do_wp_page(mm, vma, address,
                     pte, pmd, ptl, entry, flags);
         }
@@ -3676,6 +3682,7 @@ out:
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
 //        __const_udelay_poison(50000 * 0x000010c7);
+
         mem_cgroup_inc_num_badgerTrap_faults(memcg, true,
                 page_struct->in_profiling_state);
         atomic_inc(&page_struct->num_slow_mem_accesses);
@@ -3736,6 +3743,7 @@ static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
             /* TODO Fix unnecessary PMD un-reserving. */
             *pmd = pmd_unreserve(*pmd);
             spin_unlock(&mm->page_table_lock);
+            printk("COW huge page\n");
             ret = wp_huge_pmd(mm, vma, address, pmd,
                     orig_pmd, flags);
             if (!(ret & VM_FAULT_FALLBACK))

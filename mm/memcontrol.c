@@ -7091,17 +7091,29 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                      */
                     int offset = 0;
                     int num_4K_badgerTrapped = 0;
-                    while (num_4K_badgerTrapped <= 50 && offset < 512) {
-                        unsigned int page_offset;
-                        get_random_bytes(&page_offset, sizeof(unsigned int));
-                        page_offset %= 512;
-                        struct page *small_page = page + page_offset;
-                        if (atomic_read(&small_page->num_accesses) > 0) {
-                            page_poison(small_page, is_locked, NULL, true);
-                            small_page->in_profiling_state = true; 
-                            num_4K_badgerTrapped++;
+
+                    /* If splitted page was cold then mark all small 4K pages that
+                     * were accessed in previous period in profiling mode.
+                     */
+                    if (page->is_page_cold) {
+                        for (offset = 0; offset < 512; offset++) {
+                            struct page *small_page = page + offset;
+                            if (atomic_read(&small_page->num_accesses) > 0)
+                                small_page->in_profiling_state = true;
                         }
-                        offset++;
+                    } else {
+                        while (num_4K_badgerTrapped <= 50 && offset < 512) {
+                            unsigned int page_offset;
+                            get_random_bytes(&page_offset, sizeof(unsigned int));
+                            page_offset %= 512;
+                            struct page *small_page = page + page_offset;
+                            if (atomic_read(&small_page->num_accesses) > 0) {
+                                page_poison(small_page, is_locked, NULL, true);
+                                small_page->in_profiling_state = true;
+                                num_4K_badgerTrapped++;
+                            }
+                            offset++;
+                        }
                     }
 
                     /* For groundtruth remember num_accesses of all
@@ -7128,7 +7140,6 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                 if ((PageTransHuge(page) || is_page_hugetmpfs)
                         && page->in_profiling_state) {
 
-                    WARN_ON(page->is_page_cold);
                     WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
 
                     page->in_profiling_state = false;
@@ -7147,8 +7158,13 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                     for (page_offset = 0; page_offset < 512; page_offset++) {
                         struct page *small_page = page + page_offset;
-                        if (!small_page->is_page_cold && small_page->in_profiling_state) {
-                            page_poison(small_page, is_locked, NULL, false);
+                        if (small_page->in_profiling_state) {
+                            /* Un-poison a small page only if it wasn't cold to
+                             * begin with.
+                             */
+                            if (!small_page->is_page_cold)
+                                page_poison(small_page, is_locked, NULL, false);
+
                             small_page->in_profiling_state = false;
                             slow_mem_accesses += atomic_read(&small_page->num_slow_mem_accesses);
                             atomic_set(&small_page->num_slow_mem_accesses, 0);
@@ -7159,7 +7175,14 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                             num_4K_accessed_prev_period++;
                         }
                     }
-                    page_collapse_to_huge(page, is_locked, false);
+
+                    /* Collapse back the page after sampling and profiling is
+                     * done.
+                     */
+                    if (page->is_page_cold)
+                        page_collapse_to_huge(page, is_locked, true);
+                    else
+                        page_collapse_to_huge(page, is_locked, false);
 
                     /* Data for policy. Scale 4K accesses to 2M page. */
                     if (num_4K_pages_profiled)
@@ -7373,6 +7396,15 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                          * has been actually split. */
                         if(split_successful) {
                             page->in_sampling_state = 1;
+
+                            /* If splitted page was cold then mark all small 4K
+                             * pages as cold as well.
+                             */
+                            if (page->is_page_cold) {
+                                for (offset = 0; offset < 512; offset++) {
+                                    page[offset].is_page_cold = true;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -7710,19 +7742,26 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
              * of sampling period and fraction of pages we are profiling at a
              * given time.
              */
-            int target_access_rate = (200 * 1000)
+            int target_access_rate = (30 * 1000)
                                     * (memcg->poison_sampling_period - 1)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
 
             /* For policy, not needed for groundtruth data. */
             int i = 0, offset = 0;
+            int found_target = false;
+            int num_cold = 0, num_small = 0;
             for (i = 0; i < memcg->memory_access_idx; i++) {
+//                printk("slow[%d] = %d\n", i, memcg->memory_access_rates[i].access_rate);
                 access_sum += memcg->memory_access_rates[i].access_rate;
-                if (access_sum >= target_access_rate) {
+                if (!found_target && access_sum >= target_access_rate) {
                     cold_memory_fraction = (i*100) / memcg->memory_access_idx;
+                    found_target = true;
                     atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
-                    printk("target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d\n", target_access_rate, cold_memory_fraction,access_sum, memcg->memory_access_idx);
+                    printk("target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d,cold:%d,small:%d\n", target_access_rate, cold_memory_fraction,access_sum, memcg->memory_access_idx, num_cold, num_small);
+                }
+
+                if (found_target) {
                     struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
                     page_poison(profiled_page, 0, NULL, false);
                     profiled_page->is_page_cold = false;
@@ -7730,6 +7769,9 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                     struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
                     page_poison(profiled_page, 0, NULL, true);
                     profiled_page->is_page_cold = true;
+                    num_cold++;
+                    if (profiled_page->is_page_split)
+                        num_small++;
                 }
             }
 
