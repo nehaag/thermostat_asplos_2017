@@ -6794,6 +6794,9 @@ static void update_memory_access_rate(struct mem_cgroup* memcg,
         printk(KERN_WARNING "memory_access_rates buffer not large enough");
         return;
     }
+
+    atomic_set(&page_struct->expected_slow_mem_access_rate, access_rate);
+
     memcg->memory_access_rates[memcg->memory_access_idx].access_rate =
         access_rate; 
     memcg->memory_access_rates[memcg->memory_access_idx].page_struct =
@@ -7130,10 +7133,27 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                     memcg->num_pages_profiled++;
                 }
+
                 /* Reset the location where to write the next sampled memory
                  * access.
                  */
                 memcg->memory_access_idx = 0;
+
+                /* For a cold page check if accesses recieved in last sampling
+                 * period > 2 * expected access rate. If yes, then classify this
+                 * page as hot again and do not profile it.
+                 */
+                int expected_slow_access_rate = atomic_read(&page->expected_slow_mem_access_rate) / ((memcg->poison_sampling_period - 1) * kstaled_scan_seconds);
+                int slow_access_rate = atomic_read(&page->num_slow_mem_accesses) / (memcg->poison_sampling_period * kstaled_scan_seconds);
+
+                /* Page is classified wrongly. */
+                if (page->is_page_cold && !page->in_profiling_state
+                        && (slow_access_rate > 2 * expected_slow_access_rate)) {
+                    page_poison(page, is_locked, NULL, false);
+                    printk("false classification:0x%llx,%d,%d\n", page, slow_access_rate, 2 * expected_slow_access_rate);
+                }
+                atomic_set(&page->expected_slow_mem_access_rate, 0);
+
             } else if (profile_period_number ==
                     (memcg->poison_sampling_period - 1)) {
 
@@ -7175,6 +7195,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                             num_4K_accessed_prev_period++;
                         }
                     }
+                    atomic_set(&page->num_slow_mem_accesses, 0);
 
                     /* Collapse back the page after sampling and profiling is
                      * done.
@@ -7790,6 +7811,9 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             memcg->memory_access_idx = 0;
         }
 
+        /***********************
+         * NOT USED CURRENTLY
+         **********************/
         int offset;
         int access_fraction;
         memcg->page_access_cummulative_distribution[0] =

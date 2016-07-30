@@ -754,6 +754,7 @@ static inline void page_poison_reset(struct page *page)
     atomic_set(&page->num_accesses, 0);
     atomic_set(&page->num_accesses_previous_sampling_period, 0);
     atomic_set(&page->num_slow_mem_accesses, 0);
+    atomic_set(&page->expected_slow_mem_access_rate, 0);
 }
 #endif
 

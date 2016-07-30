@@ -225,6 +225,7 @@ struct page {
     atomic_t num_accesses_previous_sampling_period;
     atomic_t num_slow_mem_accesses;
     bool is_page_split;
+    atomic_t expected_slow_mem_access_rate;
 #ifdef CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE
     bool is_page_selected_for_locality_analysis;
     bool is_first_kstaled_scan_done;
