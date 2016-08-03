@@ -3909,6 +3909,8 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
             atomic64_read(&memcg->total_cold_faults));
     seq_printf(sf, "num_pages_profiled %d\n",
             memcg->num_pages_profiled_printed);
+    seq_printf(sf, "num_profiled_small_pages %d\n",
+            memcg->num_profiled_small_pages);
 
     /* Print page access distribution */
     seq_printf(sf, "num_access_distribution ");
@@ -4085,6 +4087,7 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_cold_small_bytes_kstaled_printed = 0;
     memcg->num_cold_huge_bytes_kstaled = 0;
     memcg->num_cold_huge_bytes_kstaled_printed = 0;
+    memcg->num_profiled_small_pages = 50;
 
     return 0;
 }
@@ -4212,6 +4215,27 @@ static int mem_cgroup_profile_fraction_write(struct cgroup_subsys_state *css,
         return -EINVAL;
 
     memcg->profile_fraction = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_dynamic_num_profiled_small_pages_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->dynamic_num_profiled_small_pages;
+}
+
+static int mem_cgroup_dynamic_num_profiled_small_pages_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0 || val > 100)
+        return -EINVAL;
+
+    memcg->dynamic_num_profiled_small_pages = val;
 
     return 0;
 }
@@ -4696,6 +4720,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.name = "profile_fraction",
 		.read_s64 = mem_cgroup_profile_fraction_read,
 		.write_s64 = mem_cgroup_profile_fraction_write,
+	},
+    {
+		.name = "dynamic_num_profiled_small_pages",
+		.read_s64 = mem_cgroup_dynamic_num_profiled_small_pages_read,
+		.write_s64 = mem_cgroup_dynamic_num_profiled_small_pages_write,
 	},
     {
 		.name = "slow_memory_latency_ns",
@@ -7105,7 +7134,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                                 small_page->in_profiling_state = true;
                         }
                     } else {
-                        while (num_4K_badgerTrapped <= 50 && offset < 512) {
+                        while (num_4K_badgerTrapped <= memcg->num_profiled_small_pages && offset < 512) {
                             unsigned int page_offset;
                             get_random_bytes(&page_offset, sizeof(unsigned int));
                             page_offset %= 512;
@@ -7714,6 +7743,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             &memcg->num_badgerTrap_huge_faults_cold);
     atomic_set(&memcg->num_badgerTrap_huge_faults_cold, 0);
 
+    unsigned long total_profile_faults = atomic_read(&memcg->num_badgerTrap_faults_profile) + atomic_read(&memcg->num_badgerTrap_huge_faults_profile);
     memcg->num_badgerTrap_faults_profile_printed = atomic_read(
             &memcg->num_badgerTrap_faults_profile);
     atomic_set(&memcg->num_badgerTrap_faults_profile, 0);
@@ -7767,6 +7797,19 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                                     * (memcg->poison_sampling_period - 1)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
+            int target_profile_fault_rate = (30 * 1000)
+                * memcg->poison_sampling_period
+                * memcg->profile_period
+                * kstaled_scan_seconds
+                / 2;
+            target_profile_fault_rate = target_access_rate / 2;
+
+            if (memcg->dynamic_num_profiled_small_pages &&
+                    (total_profile_faults > target_profile_fault_rate)) {
+                // the +1 is so that the profiled small pages never goes to 0.
+                memcg->num_profiled_small_pages = (memcg->num_profiled_small_pages
+                        * target_profile_fault_rate) / total_profile_faults + 1;
+            }
 
             /* For policy, not needed for groundtruth data. */
             int i = 0, offset = 0;

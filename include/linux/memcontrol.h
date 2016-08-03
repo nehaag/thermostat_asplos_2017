@@ -385,6 +385,10 @@ struct mem_cgroup {
 
     unsigned int num_pages_profiled;
     unsigned int num_pages_profiled_printed;
+
+    unsigned int num_profiled_small_pages;
+    int dynamic_num_profiled_small_pages;
+
 //    unsigned int access_corr[11][11];
 //    unsigned int access_corr_printed[11][11];
 #endif
