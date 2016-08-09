@@ -304,6 +304,7 @@ struct mem_cgroup {
     unsigned int enable_split_page;
     unsigned int poison_sampling_ratio;
     int poison_sampling_period;
+    int target_slowdown;
     int profile_period;
     int profile_fraction;
 	unsigned long num_poison_sampling_periods;
@@ -388,6 +389,8 @@ struct mem_cgroup {
 
     unsigned int num_profiled_small_pages;
     int dynamic_num_profiled_small_pages;
+
+    unsigned int num_false_classification;
 
 //    unsigned int access_corr[11][11];
 //    unsigned int access_corr_printed[11][11];

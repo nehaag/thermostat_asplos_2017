@@ -3911,6 +3911,8 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
             memcg->num_pages_profiled_printed);
     seq_printf(sf, "num_profiled_small_pages %d\n",
             memcg->num_profiled_small_pages);
+    seq_printf(sf, "num_false_classification %u\n",
+            memcg->num_false_classification);
 
     /* Print page access distribution */
     seq_printf(sf, "num_access_distribution ");
@@ -4089,6 +4091,8 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
     memcg->num_cold_huge_bytes_kstaled_printed = 0;
     memcg->num_profiled_small_pages = 50;
 
+    memcg->num_false_classification = 0;
+
     return 0;
 }
 
@@ -4152,6 +4156,27 @@ static int mem_cgroup_poison_sampling_period_write(struct cgroup_subsys_state *c
         return -EINVAL;
 
     memcg->poison_sampling_period = val;
+
+    return 0;
+}
+
+static s64 mem_cgroup_target_slowdown_read(struct cgroup_subsys_state *css,
+        struct cftype *cft)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    return memcg->target_slowdown;
+}
+
+static int mem_cgroup_target_slowdown_write(struct cgroup_subsys_state *css,
+        struct cftype *cft, s64 val)
+{
+    struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+    if (val < 0)
+        return -EINVAL;
+
+    memcg->target_slowdown = val;
 
     return 0;
 }
@@ -4705,6 +4730,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.name = "poison_sampling_period",
 		.read_s64 = mem_cgroup_poison_sampling_period_read,
 		.write_s64 = mem_cgroup_poison_sampling_period_write,
+	},
+    {
+		.name = "target_slowdown",
+		.read_s64 = mem_cgroup_target_slowdown_read,
+		.write_s64 = mem_cgroup_target_slowdown_write,
 	},
     {
 		.name = "profile_period",
@@ -7173,15 +7203,17 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * page as hot again and do not profile it.
                  */
                 int expected_slow_access_rate = atomic_read(&page->expected_slow_mem_access_rate) / ((memcg->poison_sampling_period - 1) * kstaled_scan_seconds);
+                expected_slow_access_rate = expected_slow_access_rate ? expected_slow_access_rate : 50;
                 int slow_access_rate = atomic_read(&page->num_slow_mem_accesses) / (memcg->poison_sampling_period * kstaled_scan_seconds);
 
                 /* Page is classified wrongly. */
                 if (page->is_page_cold && !page->in_profiling_state
                         && (slow_access_rate > 2 * expected_slow_access_rate)) {
                     page_poison(page, is_locked, NULL, false);
+                    memcg->num_false_classification++;
                     printk("false classification:0x%llx,%d,%d\n", page, slow_access_rate, 2 * expected_slow_access_rate);
                 }
-                atomic_set(&page->expected_slow_mem_access_rate, 0);
+//                atomic_set(&page->expected_slow_mem_access_rate, 0);
 
             } else if (profile_period_number ==
                     (memcg->poison_sampling_period - 1)) {
@@ -7793,7 +7825,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
              * of sampling period and fraction of pages we are profiling at a
              * given time.
              */
-            int target_access_rate = (30 * 1000)
+//            int target_access_rate = (30 * 1000)
+            int target_access_rate = (memcg->target_slowdown * 10 * 1000)
                                     * (memcg->poison_sampling_period - 1)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
