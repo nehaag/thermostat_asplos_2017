@@ -7208,10 +7208,11 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                 /* Page is classified wrongly. */
                 if (page->is_page_cold && !page->in_profiling_state
-                        && (slow_access_rate > 2 * expected_slow_access_rate)) {
+                        && (slow_access_rate > expected_slow_access_rate)) {
+//                        && (slow_access_rate > 2 * expected_slow_access_rate)) {
                     page_poison(page, is_locked, NULL, false);
                     memcg->num_false_classification++;
-                    printk("false classification:0x%llx,%d,%d\n", page, slow_access_rate, 2 * expected_slow_access_rate);
+                    printk("false classification:0x%llx,%d,%d\n", page, slow_access_rate, expected_slow_access_rate);
                 }
 //                atomic_set(&page->expected_slow_mem_access_rate, 0);
 
@@ -7831,8 +7832,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
             int target_profile_fault_rate = (30 * 1000)
-                * memcg->poison_sampling_period
-                * memcg->profile_period
+//                * memcg->poison_sampling_period
+//                * memcg->profile_period
                 * kstaled_scan_seconds
                 / 2;
             target_profile_fault_rate = target_access_rate / 2;
