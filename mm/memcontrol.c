@@ -7670,12 +7670,16 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 
                 if (found_target) {
                     struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
-                    page_poison(profiled_page, 0, NULL, false);
-                    profiled_page->is_page_cold = false;
+                    if (profiled_page->is_page_cold) {
+                        page_poison(profiled_page, 0, NULL, false);
+                        profiled_page->is_page_cold = false;
+                    }
                 } else {
                     struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
-                    page_poison(profiled_page, 0, NULL, true);
-                    profiled_page->is_page_cold = true;
+                    if (!profiled_page->is_page_cold) {
+                        page_poison(profiled_page, 0, NULL, true);
+                        profiled_page->is_page_cold = true;
+                    }
                     num_cold++;
                     if (profiled_page->is_page_split)
                         num_small++;
