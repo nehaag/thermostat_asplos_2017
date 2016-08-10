@@ -310,9 +310,6 @@ struct mem_cgroup {
 	unsigned long num_poison_sampling_periods;
     int warmup_scan_periods;
 
-    unsigned int page_access_distribution[513];
-    unsigned int accummulated_page_access_distribution[513];
-    unsigned int page_access_cummulative_distribution[513];
     struct page_access_rate *memory_access_rates;
     int memory_access_idx;
     unsigned int slow_memory_latency_ns;

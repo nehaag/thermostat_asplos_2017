@@ -3914,27 +3914,6 @@ static int mem_cgroup_idle_page_stats_read(struct seq_file *sf, void *v)
     seq_printf(sf, "num_false_classification %u\n",
             memcg->num_false_classification);
 
-    /* Print page access distribution */
-    seq_printf(sf, "num_access_distribution ");
-    for (bucket = 0; bucket < 50; bucket++) {
-        seq_printf(sf, "%u ", memcg->num_access_distribution_printed[bucket]);
-    }
-    seq_printf(sf, "\n");
-
-    /* Print page access distribution */
-    seq_printf(sf, "page_access_distribution ");
-    for (bucket = 0; bucket < 513; bucket++) {
-        seq_printf(sf, "%u ", memcg->page_access_distribution[bucket]);
-    }
-    seq_printf(sf, "\n");
-
-    /* Print page access distribution */
-    seq_printf(sf, "accummulated_page_access_distribution ");
-    for (bucket = 0; bucket < 513; bucket++) {
-        seq_printf(sf, "%u ", memcg->accummulated_page_access_distribution[bucket]);
-    }
-    seq_printf(sf, "\n");
-
     seq_printf(sf, "num_hot_page_threshold_adaptive %d\n",
             memcg->num_hot_page_threshold_adaptive);
     seq_printf(sf, "num_cold_page_threshold_adaptive %d\n",
@@ -4041,12 +4020,6 @@ static int mem_cgroup_enable_poison_page_write(struct cgroup_subsys_state *css,
         return -EINVAL;
 
     memcg->enable_poison_page = val;
-    memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
-    memset(memcg->accummulated_page_access_distribution, 0, 513 * sizeof(unsigned int));
-    memset(memcg->page_access_cummulative_distribution, 0,
-            513 * sizeof(unsigned int));
-    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
-//    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
     memcg->num_cold_bytes = 0;
     memcg->num_cold_bytes_printed = 0;
     memcg->num_cold_huge_bytes = 0;
@@ -7125,16 +7098,12 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
          * pages profiled)
          */
 
-        int start_new_profile_period =
-            (memcg->num_poison_sampling_periods % memcg->profile_period == 0);
+        int profile_period_number =
+            memcg->idle_page_scans % memcg->poison_sampling_period;
 
-        if ((memcg->idle_page_scans > memcg->warmup_scan_periods)
-                && start_new_profile_period) {
-
-            int profile_period_number =
-                memcg->idle_page_scans % memcg->poison_sampling_period;
-
-            if (profile_period_number == 0) {
+        if (memcg->idle_page_scans > memcg->warmup_scan_periods) {
+            if (profile_period_number > 0 &&
+                    profile_period_number < (memcg->poison_sampling_period - 1)) {
                 /* Poison a fraction of pages. */
                 if (page->in_sampling_state && page->is_page_split) {
                     page->in_sampling_state = false;
@@ -7202,20 +7171,21 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * period > 2 * expected access rate. If yes, then classify this
                  * page as hot again and do not profile it.
                  */
-                int expected_slow_access_rate = atomic_read(&page->expected_slow_mem_access_rate) / ((memcg->poison_sampling_period - 1) * kstaled_scan_seconds);
+                int expected_slow_access_rate = atomic_read(&page->expected_slow_mem_access_rate) / ((memcg->poison_sampling_period - 2) * kstaled_scan_seconds);
                 expected_slow_access_rate = expected_slow_access_rate ? expected_slow_access_rate : 50;
                 int slow_access_rate = atomic_read(&page->num_slow_mem_accesses) / (memcg->poison_sampling_period * kstaled_scan_seconds);
 
                 /* Page is classified wrongly. */
-                if (page->is_page_cold && !page->in_profiling_state
+                if (page->is_page_cold && !page->in_profiling_state && !page->is_page_split
                         && (slow_access_rate > expected_slow_access_rate)) {
-//                        && (slow_access_rate > 2 * expected_slow_access_rate)) {
                     page_poison(page, is_locked, NULL, false);
-                    memcg->num_false_classification++;
+                    page->is_page_cold = false;
+                    if (page->is_page_split)
+                        memcg->num_false_classification++;
+                    else
+                        memcg->num_false_classification += 512;
                     printk("false classification:0x%llx,%d,%d\n", page, slow_access_rate, expected_slow_access_rate);
                 }
-//                atomic_set(&page->expected_slow_mem_access_rate, 0);
-
             } else if (profile_period_number ==
                     (memcg->poison_sampling_period - 1)) {
 
@@ -7241,11 +7211,11 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                     for (page_offset = 0; page_offset < 512; page_offset++) {
                         struct page *small_page = page + page_offset;
                         if (small_page->in_profiling_state) {
-                            /* Un-poison a small page only if it wasn't cold to
-                             * begin with.
-                             */
-                            if (!small_page->is_page_cold)
-                                page_poison(small_page, is_locked, NULL, false);
+//                            /* Un-poison a small page only if it wasn't cold to
+//                             * begin with.
+//                             */
+//                            if (!small_page->is_page_cold)
+//                                page_poison(small_page, is_locked, NULL, false);
 
                             small_page->in_profiling_state = false;
                             slow_mem_accesses += atomic_read(&small_page->num_slow_mem_accesses);
@@ -7274,15 +7244,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                 } /* else page is in slow memory, should not un-poison it. */
                 memcg->num_pages_profiled = 0;
-            }
-        } else if (memcg->idle_page_scans > memcg->warmup_scan_periods) {
-
-//#if 0
-
-            /* Second part: ranking of pages. Currently implemented via
-             * sampling/splitting. Ranking is based on number of hot small (4KB)
-             * pages within a 2MB page.
-             */
+            } else if (profile_period_number == 0) {
 
             /*
              * Sample the pages to be splitted. Split a random number of pages
@@ -7292,162 +7254,10 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
              * start_new_sampling_period = 1 means we are in the sampling phase
              * to choose new set of pages to split.
              */
-            if (memcg->poison_sampling_period == 0) {
-                start_new_sampling_period = 1;
-            } else {
-                start_new_sampling_period = !(memcg->idle_page_scans %
-                        memcg->poison_sampling_period);
-            }
-
-
-            /*
-             * Before sampling new set of pages for this sampling period, tag
-             * pages as cold, hot, or hotspot according to the num_accesses
-             * collected in the *previous* sampling period.  Heuristics to
-             * decide whether page is cold or hot or hotspot: TODO
-             */
-            if (start_new_sampling_period < 0) {
-                /*
-                 * Find out if the page has been sampled in the *previous*
-                 * sampling period.
-                 */
-                if (page->in_sampling_state && page->is_page_split) {
-
-                    /*
-                     * We have only sampled huge pages. Suddenly they should not
-                     * have become non-huge pages.
-                     */
-                    WARN_ON(!(PageTransHuge(page) || is_page_hugetmpfs));
-
-                    /*
-                     * Reset the page to not be in sampling state. We will
-                     * sample new set of pages below.
-                     */
-                    page->in_sampling_state = 0;
-
-                    /*
-                     * Count the number of hot small pages in this 2MB page. Hot
-                     * is defined as num_accesses >= hot_small_page_threshold
-                     * over the entire sampling period.
-                     */
-                    int num_hot_small_pages = 0;
-                    for (offset = 0; offset < 512; offset++) {
-                        struct page *small_page = page + offset;
-                        int read_num_accesses =
-                            atomic_read(&small_page->num_accesses);
-                        if (read_num_accesses >=
-                                memcg->hot_small_page_threshold) {
-                            num_hot_small_pages++;
-                        }
-
-                        /*
-                         * Update the num_access_distribution histogram in the
-                         * memcg with the number of accesses of this small page.
-                         * The histogram is clipped at 49 accesses.
-                         */
-                        int bin_number = read_num_accesses;
-                        if (bin_number >= 49)
-                            bin_number = 49;
-                        memcg->num_access_distribution[bin_number]++;
-                    }
-
-                    /*
-                     * We also maintain a distribution of how many hot small
-                     * pages were found in each sampled huge page.
-                     */
-                    memcg->page_access_distribution[num_hot_small_pages]++;
-                    memcg->accummulated_page_access_distribution[num_hot_small_pages]++;
-
-                    /*
-                     * Tag huge page as cold/hot or if huge page is a hotspot
-                     * page, tag small pages inside it as cold/hot.
-                     */
-                    if (num_hot_small_pages == 512 ||
-                            (num_hot_small_pages >=
-                             memcg->num_hot_page_threshold_adaptive)) {
-                        /* This huge page is HOT, so we should collapse it. */
-                        page->in_sampling_state = 0;
-                        page->is_page_cold = false;
-                        page_collapse_to_huge(page, is_locked, false);
-                        memcg->num_collapse_failed_hot += page->is_page_split
-                            ? 1 : 0;
-
-                        bool found_atleast_one_cold_page = false;
-                        for (offset = 0; offset < 512; offset++) {
-                            struct page *small_page = page + offset;
-                            if (small_page->is_page_cold)
-                                found_atleast_one_cold_page = true;
-                            small_page->is_page_cold = false;
-                            atomic_set(&small_page->num_accesses, 0);
-                        }
-
-                        if (found_atleast_one_cold_page)
-                            memcg->num_migration_bytes += 2097152;
-                    } else if(num_hot_small_pages <
-                            memcg->num_cold_page_threshold_adaptive) {
-                        /*
-                         * This huge page is COLD, collapse this as well. Also
-                         * poison it so that accesses to this page are slowed
-                         * down by badgertrap.
-                         */
-                        page->is_page_cold = true;
-
-                        page->in_sampling_state = 0;
-                        page_collapse_to_huge(page, is_locked, true);
-                        memcg->num_collapse_failed_cold += page->is_page_split
-                            ? 1 : 0;
-
-                        bool found_atleast_one_hot_page = false;
-                        for (offset = 0; offset < 512; offset++) {
-                            struct page *small_page = page + offset;
-                            if (!small_page->is_page_cold)
-                                found_atleast_one_hot_page = true;
-                            small_page->is_page_cold = true;
-                            atomic_set(&small_page->num_accesses, 0);
-                        }
-
-                        if (found_atleast_one_hot_page)
-                            memcg->num_migration_bytes += 2097152;
-                    } else {
-                        /*
-                         * This huge page is hotspot. Since the huge page PMD is
-                         * already split, we don't need to do any further
-                         * splitting.  Tag the small pages as hot or cold based
-                         * on if its num_accesses is > or <=
-                         * hotspot_hot_page_threshold.  Also poison the "cold"
-                         * small pages so that accesses to this page are slowed
-                         * down by badgertrap.
-                         */
-                        for (offset = 0; offset < 512; offset++) {
-                            struct page *small_page = page + offset;
-                            small_page->in_sampling_state = 0;
-                            int read_num_accesses =
-                                atomic_read(&small_page->num_accesses);
-
-                            if (read_num_accesses <
-                                    memcg->hotspot_hot_page_threshold) {
-                                /* poison this small page */
-                                page_poison(small_page, is_locked, NULL, true);
-                                if (!small_page->is_page_cold)
-                                    memcg->num_migration_bytes += 4096;
-                                small_page->is_page_cold = true;
-                                atomic_set(&small_page->num_accesses, 0);
-                            } else {
-                                if (small_page->is_page_cold)
-                                    memcg->num_migration_bytes += 4096;
-                                small_page->is_page_cold = false;
-                                atomic_set(&small_page->num_accesses, 0);
-                            }
-                        }
-                    }
-                }
-            }
-
             /*
              * Sample the new set of huge pages for this sampling period, and
              * split the PMDs for those huge pages.
              */
-            if (start_new_sampling_period) {
                 /*
                  * Sample this page if:
                  * a) the random_number is < sampling_ratio (we are sampling
@@ -7507,10 +7317,9 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                         atomic_set(&page[offset].num_accesses, 0);
                     }
                 }
-            }
-//#endif
-        }
-    }
+            } /* (profile_period_number == 0) */
+        } /* (memcg->idle_page_scans > memcg->warmup_scan_periods) */
+    } /* memcg->enable_poison_page */
 
     //    unlock_page_cgroup(pc);
 #endif /* CONFIG_LOCALITY_ANALYSIS_BY_POISON_PAGE */
@@ -7887,51 +7696,6 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             // TODO: check if this is needed?
             memcg->memory_access_idx = 0;
         }
-
-        /***********************
-         * NOT USED CURRENTLY
-         **********************/
-        int offset;
-        int access_fraction;
-        memcg->page_access_cummulative_distribution[0] =
-            memcg->page_access_distribution[0];
-        for (offset = 1; offset < 513; offset++) {
-            memcg->page_access_cummulative_distribution[offset] =
-                memcg->page_access_cummulative_distribution[offset - 1]
-                + memcg->page_access_distribution[offset];
-        }
-
-        for (offset = 0; offset < 513; offset++) {
-            access_fraction =
-                (memcg->page_access_cummulative_distribution[offset]
-                 * 100)
-                / (memcg->page_access_cummulative_distribution[512]
-                        + 1);
-//            if (access_fraction >= memcg->cold_memory_fraction) {
-            if (access_fraction >= atomic_read(&memcg->cold_memory_fraction_atomic)) {
-//                printk("cold_memory_fraction:%d,access_fraction:%d,offset:%d\n", atomic_read(&memcg->cold_memory_fraction_atomic), access_fraction, offset);
-                memcg->num_hot_page_threshold_adaptive = offset;
-                memcg->num_cold_page_threshold_adaptive = offset;
-                break;
-            }
-        }
-
-        for (; offset < 513; offset++) {
-            access_fraction =
-                (memcg->page_access_cummulative_distribution[offset]
-                 * 100)
-                / (memcg->page_access_cummulative_distribution[512]
-                        + 1);
- 
-            if (access_fraction >=
-                 atomic_read(&memcg->cold_memory_fraction_atomic) + memcg->hotspot_memory_fraction) {
-//                 memcg->cold_memory_fraction + memcg->hotspot_memory_fraction) {
-                memcg->num_hot_page_threshold_adaptive = offset;
-                break;
-            }
-        }
-
-        memset(memcg->page_access_distribution, 0, 513 * sizeof(unsigned int));
     }
 
     if(memcg->poison_sampling_period
