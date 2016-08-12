@@ -7673,12 +7673,16 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                     if (profiled_page->is_page_cold) {
                         page_poison(profiled_page, 0, NULL, false);
                         profiled_page->is_page_cold = false;
+                        /* Increment migration bytes. */
+                        memcg->num_migration_bytes += 2097152;
                     }
                 } else {
                     struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
                     if (!profiled_page->is_page_cold) {
                         page_poison(profiled_page, 0, NULL, true);
                         profiled_page->is_page_cold = true;
+                        /* Increment migration bytes. */
+                        memcg->num_migration_bytes += 2097152;
                     }
                     num_cold++;
                     if (profiled_page->is_page_split)
