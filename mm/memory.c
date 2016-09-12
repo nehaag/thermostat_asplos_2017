@@ -3681,7 +3681,12 @@ out:
 //        udelay(mem_cgroup_slow_memory_latency_ns(memcg));
 //        delay_loop(20);
 //        __const_udelay_poison(50000 * 0x00005);
-//        __const_udelay_poison(50000 * 0x000010c7);
+//            __const_udelay_poison(50000 * 0x000010c7);
+        /* For added latency. This gave around 1us more latency for redis highly
+         * skewed pattern
+         */
+//        if (page_struct->is_page_cold)
+//            __const_udelay_poison(70000 * 0x000010c7);
 
         mem_cgroup_inc_num_badgerTrap_faults(memcg, true,
                 page_struct->in_profiling_state);

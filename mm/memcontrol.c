@@ -7244,6 +7244,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
 
                 } /* else page is in slow memory, should not un-poison it. */
                 memcg->num_pages_profiled = 0;
+                atomic_set(&page->num_slow_mem_accesses, 0);
             } else if (profile_period_number == 0) {
 
             /*
@@ -7636,8 +7637,8 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
              * given time.
              */
 //            int target_access_rate = (30 * 1000)
-            int target_access_rate = (memcg->target_slowdown * 10 * 1000)
-                                    * (memcg->poison_sampling_period - 1)
+            int target_access_rate = (memcg->target_slowdown * 1000)
+                                    * (memcg->poison_sampling_period - 2)
                                     * kstaled_scan_seconds
                                     * memcg->profile_fraction / 100;
             int target_profile_fault_rate = (30 * 1000)
@@ -7659,7 +7660,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             int found_target = false;
             int num_cold = 0, num_small = 0;
             for (i = 0; i < memcg->memory_access_idx; i++) {
-//                printk("slow[%d] = %d\n", i, memcg->memory_access_rates[i].access_rate);
+//                printk("slow[%d] = %d ", i, memcg->memory_access_rates[i].access_rate);
                 access_sum += memcg->memory_access_rates[i].access_rate;
                 if (!found_target && access_sum >= target_access_rate) {
                     cold_memory_fraction = (i*100) / memcg->memory_access_idx;
@@ -7689,6 +7690,7 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                         num_small++;
                 }
             }
+//            printk("\n");
 
             /* For groudtruth data dump, uncomment printk's. */
             for (i = 0; i < memcg->memory_access_idx; i++) {
