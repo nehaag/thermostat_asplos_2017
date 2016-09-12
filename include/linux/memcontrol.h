@@ -312,6 +312,8 @@ struct mem_cgroup {
 
     struct page_access_rate *memory_access_rates;
     int memory_access_idx;
+    struct page_access_rate *cold_memory_access_rates;
+    int cold_memory_access_idx;
     unsigned int slow_memory_latency_ns;
     int hot_small_page_threshold;
     int hotspot_hot_page_threshold;
