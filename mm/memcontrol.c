@@ -7221,7 +7221,7 @@ static unsigned kstaled_scan_page(struct page *page, u8 *idle_page_age)
                  * fast DRAM. */
                 if (page->is_page_cold) {
                     int slow_access_rate = atomic_read(&page->num_slow_mem_accesses)
-                        / ((memcg->poison_sampling_period - 1)* kstaled_scan_seconds);
+                        / (kstaled_scan_seconds);
                     track_cold_memory_access_rate(memcg, page, slow_access_rate);
                 }
             } else if (profile_period_number ==
@@ -7555,6 +7555,62 @@ static int cmp_func_increasing(const void *a, const void *b)
     return 0;
 }
 
+static void run_false_classification_policy(struct mem_cgroup* memcg) {
+    /* Logic for false classification detection. */
+    if (memcg->cold_memory_access_rates) {
+        printk(KERN_WARNING "cold num rates: %d\n", memcg->cold_memory_access_idx);
+        sort(memcg->cold_memory_access_rates, memcg->cold_memory_access_idx,
+                sizeof(struct page_access_rate),
+                cmp_func_increasing, NULL);
+
+        int access_sum = 0;
+        /* Target access rate 30K accesses/sec has to be scaled with length
+         * of sampling period and fraction of pages we are profiling at a
+         * given time.
+         */
+
+        //TODO: check the target access rate and slow access rate
+        //denominators.
+        int target_access_rate = (memcg->target_slowdown * 1000);
+        //                                    * (memcg->poison_sampling_period)
+        //                                    * kstaled_scan_seconds
+        //                                    * memcg->profile_fraction / 100;
+
+        int i = 0, offset = 0;
+        bool found_target = false;
+        int num_cold = 0, num_small = 0;
+        for (i = 0; i < memcg->cold_memory_access_idx; i++) {
+            /* printk("slow[%d] = %d ", i, memcg->cold_memory_access_rates[i].access_rate); */
+            access_sum += memcg->cold_memory_access_rates[i].access_rate;
+            if (!found_target && access_sum >= target_access_rate) {
+                int cold_memory_fraction = (i*100) / memcg->cold_memory_access_idx;
+                found_target = true;
+                printk("false class: target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d,cold:%d\n",
+                        target_access_rate, cold_memory_fraction, access_sum, memcg->cold_memory_access_idx, num_cold);
+            }
+
+            if (found_target) {
+                /* Page is wrongly classified as cold. Migrate back to DRAM.
+                */
+                struct page *profiled_page = memcg->cold_memory_access_rates[i].page_struct;
+                if (profiled_page->is_page_cold) {
+                    page_poison(profiled_page, 0, NULL, false);
+                    profiled_page->is_page_cold = false;
+                    /* Increment migration bytes. */
+                    memcg->num_migration_bytes += 2097152;
+                    printk("false classification:%d\n", memcg->cold_memory_access_rates[i].access_rate);
+                }
+            } else {
+                /* Page should be classified as cold. Do Nothing. */
+                num_cold++;
+                //                    printk("correct[%d] = %d ", i, memcg->cold_memory_access_rates[i].access_rate);
+            }
+        }
+        printk("total_sum: %d\n", access_sum);
+        memcg->cold_memory_access_idx = 0;
+    }
+}
+
 static void kstaled_update_stats(struct mem_cgroup *memcg)
 {
     struct idle_page_stats tot;
@@ -7744,62 +7800,10 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
             // TODO: check if this is needed?
             memcg->memory_access_idx = 0;
         }
-
-        /* Logic for false classification detection. */
-        if (memcg->cold_memory_access_rates) {
-            printk(KERN_WARNING "cold num rates: %d\n", memcg->cold_memory_access_idx);
-            sort(memcg->cold_memory_access_rates, memcg->cold_memory_access_idx,
-                    sizeof(struct page_access_rate),
-                    cmp_func_increasing, NULL);
-
-            int access_sum = 0;
-            /* Target access rate 30K accesses/sec has to be scaled with length
-             * of sampling period and fraction of pages we are profiling at a
-             * given time.
-             */
-
-            //TODO: check the target access rate and slow access rate
-            //denominators.
-            int target_access_rate = (memcg->target_slowdown * 1000);
-//                                    * (memcg->poison_sampling_period)
-//                                    * kstaled_scan_seconds
-//                                    * memcg->profile_fraction / 100;
-
-            int i = 0, offset = 0;
-            int found_target = false;
-            int num_cold = 0, num_small = 0;
-            for (i = 0; i < memcg->cold_memory_access_idx; i++) {
-                /* printk("slow[%d] = %d ", i, memcg->cold_memory_access_rates[i].access_rate); */
-                access_sum += memcg->cold_memory_access_rates[i].access_rate;
-                if (!found_target && access_sum >= target_access_rate) {
-                    cold_memory_fraction = (i*100) / memcg->cold_memory_access_idx;
-                    found_target = true;
-                    printk("false class: target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d,cold:%d\n", target_access_rate, cold_memory_fraction, access_sum, memcg->cold_memory_access_idx, num_cold);
-                }
-
-                if (found_target) {
-                    /* Page is wrongly classified as cold. Migrate back to DRAM.
-                     */
-                    struct page *profiled_page = memcg->cold_memory_access_rates[i].page_struct;
-                    if (profiled_page->is_page_cold) {
-                        page_poison(profiled_page, 0, NULL, false);
-                        profiled_page->is_page_cold = false;
-                        /* Increment migration bytes. */
-                        memcg->num_migration_bytes += 2097152;
-                        printk("false classification:%d\n", memcg->cold_memory_access_rates[i].access_rate);
-                    }
-                } else {
-                    /* Page should be classified as cold. Do Nothing. */
-                    num_cold++;
-//                    printk("correct[%d] = %d ", i, memcg->cold_memory_access_rates[i].access_rate);
-                }
-            }
-
-            printk("total_sum: %d\n", access_sum);
-
-            memcg->cold_memory_access_idx = 0;
-        }
     }
+
+    // Run the false classification policy every scan period.
+    run_false_classification_policy(memcg);
 
     if(memcg->poison_sampling_period
             && (memcg->idle_page_scans % memcg->poison_sampling_period  == 0)) {
