@@ -7555,6 +7555,56 @@ static int cmp_func_increasing(const void *a, const void *b)
     return 0;
 }
 
+
+static void run_classification_policy(struct mem_cgroup* memcg, int target_access_rate) {
+    int i = 0, offset = 0;
+    int found_cold_classification_target = false;
+    int num_cold = 0, num_small = 0;
+    int access_sum = 0;
+    int cold_memory_fraction = 0;
+
+    /* For policy, not needed for groundtruth data. */
+    for (i = 0; i < memcg->memory_access_idx; i++) {
+//        printk("slow[%d] = %d ", i, memcg->memory_access_rates[i].access_rate);
+        access_sum += memcg->memory_access_rates[i].access_rate;
+        
+        /* Sum the coldest pages to meet the target_access_rate and then shove
+         * them to the slow memory technology.
+         */ 
+        if (!found_cold_classification_target && access_sum >= target_access_rate) {
+            cold_memory_fraction = (i*100) / memcg->memory_access_idx;
+            found_cold_classification_target = true;
+            atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
+            printk("target:%d,cold_memory_fraction:%d,access_sum:%d,"
+                    "num:%d,cold:%d,small:%d\n",
+                    target_access_rate,
+                    cold_memory_fraction,access_sum,
+                    memcg->memory_access_idx, num_cold, num_small);
+        }
+
+        if (found_cold_classification_target) {
+            struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
+            if (profiled_page->is_page_cold) {
+                page_poison(profiled_page, 0, NULL, false);
+                profiled_page->is_page_cold = false;
+                /* Increment migration bytes. */
+                memcg->num_migration_bytes += 2097152;
+            }
+        } else {
+            struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
+            if (!profiled_page->is_page_cold) {
+                page_poison(profiled_page, 0, NULL, true);
+                profiled_page->is_page_cold = true;
+                /* Increment migration bytes. */
+                memcg->num_migration_bytes += 2097152;
+            }
+            num_cold++;
+            if (profiled_page->is_page_split)
+                num_small++;
+        }
+    }
+}
+
 static void run_false_classification_policy(struct mem_cgroup* memcg) {
     /* Logic for false classification detection. */
     if (memcg->cold_memory_access_rates) {
@@ -7693,11 +7743,6 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
 
     memcpy(memcg->num_access_distribution_printed, 
             memcg->num_access_distribution, 50 * sizeof(unsigned int));
-//    memset(memcg->num_access_distribution, 0, 50 * sizeof(unsigned int));
-
-//    memcpy(memcg->access_corr_printed, 
-//            memcg->access_corr, 11 * 11 * sizeof(unsigned int));
-//    memset(memcg->access_corr, 0, 11 * 11 * sizeof(unsigned int));
 
     /*
      * Cumulative page access distribution for approximating
@@ -7718,14 +7763,12 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
          * the memory access rate corresponding to 3% slowdown budget. It is 30K
          * accesses/sec.
          */
-        int cold_memory_fraction = 0;
         if (memcg->memory_access_rates) {
             printk(KERN_WARNING "num rates: %d\n", memcg->memory_access_idx);
             sort(memcg->memory_access_rates, memcg->memory_access_idx,
                     sizeof(struct page_access_rate),
                     cmp_func_increasing, NULL);
 
-            int access_sum = 0;
             /* Target access rate 30K accesses/sec has to be scaled with length
              * of sampling period and fraction of pages we are profiling at a
              * given time.
@@ -7749,44 +7792,11 @@ static void kstaled_update_stats(struct mem_cgroup *memcg)
                         * target_profile_fault_rate) / total_profile_faults + 1;
             }
 
-            /* For policy, not needed for groundtruth data. */
-            int i = 0, offset = 0;
-            int found_target = false;
-            int num_cold = 0, num_small = 0;
-            for (i = 0; i < memcg->memory_access_idx; i++) {
-//                printk("slow[%d] = %d ", i, memcg->memory_access_rates[i].access_rate);
-                access_sum += memcg->memory_access_rates[i].access_rate;
-                if (!found_target && access_sum >= target_access_rate) {
-                    cold_memory_fraction = (i*100) / memcg->memory_access_idx;
-                    found_target = true;
-                    atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
-                    printk("target:%d,cold_memory_fraction:%d,access_sum:%d,num:%d,cold:%d,small:%d\n", target_access_rate, cold_memory_fraction,access_sum, memcg->memory_access_idx, num_cold, num_small);
-                }
-
-                if (found_target) {
-                    struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
-                    if (profiled_page->is_page_cold) {
-                        page_poison(profiled_page, 0, NULL, false);
-                        profiled_page->is_page_cold = false;
-                        /* Increment migration bytes. */
-                        memcg->num_migration_bytes += 2097152;
-                    }
-                } else {
-                    struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
-                    if (!profiled_page->is_page_cold) {
-                        page_poison(profiled_page, 0, NULL, true);
-                        profiled_page->is_page_cold = true;
-                        /* Increment migration bytes. */
-                        memcg->num_migration_bytes += 2097152;
-                    }
-                    num_cold++;
-                    if (profiled_page->is_page_split)
-                        num_small++;
-                }
-            }
-//            printk("\n");
-
+            /* Run the classification policy every samling period. */
+            run_classification_policy(memcg, target_access_rate);
+            
             /* For groudtruth data dump, uncomment printk's. */
+            int offset = 0;
             for (i = 0; i < memcg->memory_access_idx; i++) {
                 struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
                 /* printk("0x%llx, %d ", profiled_page, memcg->memory_access_rates[i].access_rate); */
