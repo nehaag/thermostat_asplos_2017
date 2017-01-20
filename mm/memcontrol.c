@@ -7563,6 +7563,16 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
     int access_sum = 0;
     int cold_memory_fraction = 0;
 
+    /* Following code is for experiment to study performance variation as we
+     * split up coldest hot huge pages into 4K pages. Trade-off lies between
+     * identifying more cold segements in hot pages vs. penalty we pay because
+     * of breaking hot pages.
+     */
+    /* Fraction of hot huges pages to split = 10% to start with.
+     * TODO: Parameterize this variable. */
+    int num_hot_pages_to_split = (10 * memcg->memory_access_idx) / 100;
+    int num_hot_pages_splitted = 0;
+
     /* For policy, not needed for groundtruth data. */
     for (i = 0; i < memcg->memory_access_idx; i++) {
 //        printk("slow[%d] = %d ", i, memcg->memory_access_rates[i].access_rate);
@@ -7590,7 +7600,24 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
                 /* Increment migration bytes. */
                 memcg->num_migration_bytes += 2097152;
             }
+
+            /* Break this hot page if fraction of hot pages to be broken not
+             * met.
+             */
+//            if (num_hot_pages_to_split < num_hot_pages_splitted) {
+//                /* Split the huge page if not already. */
+//                // TODO: fix the splitting stats
+//                if (!profiled_page->is_page_split) {
+//                    // TODO: check the false flag.
+//                    int split_successful = page_split_for_sampling(
+//                            profiled_page, false);
+//                }
+//
+//                if (profiled_page->is_page_split)
+//                    num_hot_pages_splitted++;
+//            }
         } else {
+            //TODO: If the page was splitted previously then collapse it back.
             struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
             if (!profiled_page->is_page_cold) {
                 page_poison(profiled_page, 0, NULL, true);
