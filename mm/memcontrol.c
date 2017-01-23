@@ -7586,10 +7586,11 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
             found_cold_classification_target = true;
             atomic_set(&memcg->cold_memory_fraction_atomic, cold_memory_fraction);
             printk("target:%d,cold_memory_fraction:%d,access_sum:%d,"
-                    "num:%d,cold:%d,small:%d\n",
+                    "num:%d,cold:%d,small:%d,to_split:%d\n",
                     target_access_rate,
                     cold_memory_fraction,access_sum,
-                    memcg->memory_access_idx, num_cold, num_small);
+                    memcg->memory_access_idx, num_cold, num_small,
+                    num_hot_pages_to_split);
         }
 
         if (found_cold_classification_target) {
@@ -7604,8 +7605,8 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
             /* Break this hot page if fraction of hot pages to be broken not
              * met.
              */
-            if (num_hot_pages_to_split < num_hot_pages_splitted) {
-                /* Split the huge page if not already. */
+            if (num_hot_pages_splitted < num_hot_pages_to_split) {
+                /* Split this huge page if not already. */
                 // TODO: fix the splitting stats
                 if (!profiled_page->is_page_split) {
                     // TODO: check the false flag.
