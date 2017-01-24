@@ -7570,7 +7570,7 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
      */
     /* Fraction of hot huges pages to split = 10% to start with.
      * TODO: Parameterize this variable. */
-    int num_hot_pages_to_split = (10 * memcg->memory_access_idx) / 100;
+    int num_hot_pages_to_split = (50 * memcg->memory_access_idx) / 100;
     int num_hot_pages_splitted = 0;
 
     /* For policy, not needed for groundtruth data. */
@@ -7602,21 +7602,21 @@ static void run_classification_policy(struct mem_cgroup* memcg, int target_acces
                 memcg->num_migration_bytes += 2097152;
             }
 
-            /* Break this hot page if fraction of hot pages to be broken not
-             * met.
-             */
-            if (num_hot_pages_splitted < num_hot_pages_to_split) {
-                /* Split this huge page if not already. */
-                // TODO: fix the splitting stats
-                if (!profiled_page->is_page_split) {
-                    // TODO: check the false flag.
-                    int split_successful = page_split_for_sampling(
-                            profiled_page, false);
-                }
-
-                if (profiled_page->is_page_split)
-                    num_hot_pages_splitted++;
-            }
+//            /* Break this hot page if fraction of hot pages to be broken not
+//             * met.
+//             */
+//            if (num_hot_pages_splitted < num_hot_pages_to_split) {
+//                /* Split this huge page if not already. */
+//                // TODO: fix the splitting stats
+//                if (!profiled_page->is_page_split) {
+//                    // TODO: check the false flag.
+//                    int split_successful = page_split_for_sampling(
+//                            profiled_page, false);
+//                }
+//
+//                if (profiled_page->is_page_split)
+//                    num_hot_pages_splitted++;
+//            }
         } else {
             //TODO: If the page was splitted previously then collapse it back.
             struct page *profiled_page = memcg->memory_access_rates[i].page_struct;
@@ -7672,7 +7672,24 @@ static void run_false_classification_policy(struct mem_cgroup* memcg) {
                 */
                 struct page *profiled_page = memcg->cold_memory_access_rates[i].page_struct;
                 if (profiled_page->is_page_cold) {
-                    page_poison(profiled_page, 0, NULL, false);
+
+                    /* Trying to solve Cassandra bug. */
+                    bool is_locked = false;
+
+                    if (PageAnon(profiled_page) || PageSwapCache(profiled_page)) {
+                        // No need to lock the page.
+                        ;
+                    } else if (!trylock_page(profiled_page)) {
+                        continue;
+                    } else {
+                        is_locked = true;
+                    }
+
+                    page_poison(profiled_page, is_locked, NULL, false);
+
+                    if (is_locked)
+                        unlock_page(profiled_page);
+
                     profiled_page->is_page_cold = false;
                     /* Increment migration bytes. */
                     memcg->num_migration_bytes += 2097152;
